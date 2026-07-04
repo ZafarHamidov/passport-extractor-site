@@ -17,6 +17,7 @@ import {
   RotateCw,
   Search,
   ShieldCheck,
+  Sparkles,
   Trash2,
   Upload,
   X,
@@ -53,6 +54,32 @@ type ExtractionAttempt = {
   variant: string;
   score: number;
   candidateCount: number;
+};
+
+type AiSeverity = 'good' | 'warning' | 'critical';
+
+type AiIssue = {
+  id: string;
+  severity: AiSeverity;
+  messageKey: string;
+  detail?: string;
+};
+
+type AiSuggestion = {
+  id: string;
+  field: FieldKey;
+  labelKey: string;
+  suggestedValue: string;
+  currentValue: string;
+  reasonKey: string;
+  confidence: number;
+};
+
+type AiReview = {
+  confidence: number;
+  summaryKey: string;
+  issues: AiIssue[];
+  suggestions: AiSuggestion[];
 };
 
 type PassportRecord = {
@@ -196,6 +223,31 @@ const translations = {
     copied: 'copied',
     languageToggle: 'RU',
     extractionAttemptPrefix: 'Best attempt',
+    aiAssistant: 'AI review',
+    aiPrivate: 'Local assistant. Nothing is uploaded.',
+    aiConfidence: 'AI confidence',
+    aiApply: 'Apply',
+    aiApplyAll: 'Apply all',
+    aiSuggestions: 'Suggested fixes',
+    aiChecks: 'AI checks',
+    aiNoSuggestions: 'No suggested fixes.',
+    aiNoIssues: 'No issues found.',
+    aiSummaryStrong: 'Looks ready to copy after a quick visual check.',
+    aiSummaryReview: 'Review the highlighted fields before copying.',
+    aiSummaryManual: 'Needs manual review before use.',
+    aiMissingPassportNumber: 'Passport number is missing.',
+    aiMissingRequiredFields: 'Required travel fields are missing.',
+    aiInvalidCheckDigits: 'MRZ check digits need review.',
+    aiExpiredPassport: 'Passport appears expired.',
+    aiExpiringSoon: 'Passport expires soon.',
+    aiInvalidBirthDate: 'Birth date looks invalid.',
+    aiUnusualPassportNumber: 'Passport number format looks unusual.',
+    aiNoMrzText: 'MRZ text was not found.',
+    aiForeignTextFound: 'Foreign-language visual text was detected.',
+    aiRotationMismatch: 'Best OCR result used a different rotation.',
+    aiLowOcrConfidence: 'OCR confidence is low.',
+    aiUseMrzSuggestion: 'MRZ parse suggests this value.',
+    aiSuggestionArrow: 'to',
   },
   ru: {
     appTitle: 'Паспортный экстрактор Zafar',
@@ -281,6 +333,31 @@ const translations = {
     invalidLabel: 'Неверно',
     copied: 'скопировано',
     languageToggle: 'EN',
+    aiAssistant: 'AI проверка',
+    aiPrivate: 'Локальный помощник. Данные не отправляются.',
+    aiConfidence: 'Уверенность AI',
+    aiApply: 'Применить',
+    aiApplyAll: 'Применить все',
+    aiSuggestions: 'Предложенные исправления',
+    aiChecks: 'AI проверки',
+    aiNoSuggestions: 'Нет предложений.',
+    aiNoIssues: 'Проблем не найдено.',
+    aiSummaryStrong: 'Можно копировать после короткой визуальной проверки.',
+    aiSummaryReview: 'Проверьте выделенные поля перед копированием.',
+    aiSummaryManual: 'Нужна ручная проверка перед использованием.',
+    aiMissingPassportNumber: 'Номер паспорта не найден.',
+    aiMissingRequiredFields: 'Не хватает обязательных полей для билета.',
+    aiInvalidCheckDigits: 'Контрольные цифры MRZ требуют проверки.',
+    aiExpiredPassport: 'Паспорт выглядит просроченным.',
+    aiExpiringSoon: 'Паспорт скоро истекает.',
+    aiInvalidBirthDate: 'Дата рождения выглядит неверно.',
+    aiUnusualPassportNumber: 'Формат номера паспорта необычный.',
+    aiNoMrzText: 'MRZ текст не найден.',
+    aiForeignTextFound: 'Найден видимый текст на иностранном языке.',
+    aiRotationMismatch: 'Лучший OCR результат использовал другой поворот.',
+    aiLowOcrConfidence: 'Уверенность OCR низкая.',
+    aiUseMrzSuggestion: 'MRZ предлагает это значение.',
+    aiSuggestionArrow: 'на',
     extractionAttemptPrefix: 'Лучшая попытка',
   },
 } satisfies Record<AppLanguage, Record<string, string>>;
@@ -637,6 +714,209 @@ function normalizedFieldsFromExtracted(fields: ExtractedFields): NormalizedField
   };
 }
 
+const requiredTravelFields: FieldKey[] = [
+  'passportNumber',
+  'lastName',
+  'firstNames',
+  'birthDate',
+  'sex',
+  'expirationDate',
+  'nationality',
+];
+
+const fieldLabelKeysByField = fieldLabels.reduce<Record<FieldKey, string>>((labels, field) => {
+  labels[field.key] = field.labelKey;
+  return labels;
+}, {} as Record<FieldKey, string>);
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function parseTravelDate(value: string) {
+  const match = value.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!match) {
+    return null;
+  }
+
+  const [, dayText, monthText, yearText] = match;
+  const day = Number(dayText);
+  const month = Number(monthText);
+  const year = Number(yearText);
+
+  if (!isValidDate(year, month, day)) {
+    return null;
+  }
+
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+function getAiFieldValue(record: PassportRecord, key: FieldKey) {
+  return getDisplayField(record, key).trim();
+}
+
+function getParsedSuggestionValue(fields: ExtractedFields, normalizedFields: NormalizedFields, key: FieldKey) {
+  if (key === 'birthDate' || key === 'expirationDate') {
+    return normalizedFields[key] || fields[key];
+  }
+
+  return fields[key];
+}
+
+function buildMrzFieldSuggestions(record: PassportRecord): AiSuggestion[] {
+  const sourceText = [record.rawMrz, record.ocrText, record.embeddedText].filter(Boolean).join('\n');
+  if (!sourceText.trim()) {
+    return [];
+  }
+
+  const parsed = parseBestMrz(sourceText);
+  if (!parsed) {
+    return [];
+  }
+
+  const fields = extractedFieldsFromParse(parsed.result);
+  const normalizedFields = normalizedFieldsFromExtracted(fields);
+  const confidence = parsed.result.valid ? 98 : clamp(Math.round(68 + parsed.score / 3), 68, 92);
+
+  return fieldLabels.flatMap((field) => {
+    const suggestedValue = getParsedSuggestionValue(fields, normalizedFields, field.key).trim();
+    const currentValue = getAiFieldValue(record, field.key);
+
+    if (!suggestedValue || currentValue === suggestedValue) {
+      return [];
+    }
+
+    return [
+      {
+        id: `${field.key}-${suggestedValue}`,
+        field: field.key,
+        labelKey: field.labelKey,
+        suggestedValue,
+        currentValue,
+        reasonKey: 'aiUseMrzSuggestion',
+        confidence,
+      },
+    ];
+  });
+}
+
+function buildAiReview(record: PassportRecord): AiReview {
+  const issues: AiIssue[] = [];
+  const suggestions = buildMrzFieldSuggestions(record);
+  const missingFields = requiredTravelFields.filter((key) => !getAiFieldValue(record, key));
+  const invalidDetails = record.validationDetails.filter((detail) => !detail.valid);
+  const passportNumber = getAiFieldValue(record, 'passportNumber');
+  const birthDate = getAiFieldValue(record, 'birthDate');
+  const expirationDate = getAiFieldValue(record, 'expirationDate');
+  const parsedBirthDate = birthDate ? parseTravelDate(birthDate) : null;
+  const parsedExpirationDate = expirationDate ? parseTravelDate(expirationDate) : null;
+  const now = new Date();
+
+  if (!passportNumber) {
+    issues.push({ id: 'missing-passport-number', severity: 'critical', messageKey: 'aiMissingPassportNumber' });
+  } else if (!/^[A-Z0-9]{6,12}$/i.test(passportNumber)) {
+    issues.push({ id: 'unusual-passport-number', severity: 'warning', messageKey: 'aiUnusualPassportNumber' });
+  }
+
+  if (missingFields.length > 1 || (missingFields.length === 1 && missingFields[0] !== 'passportNumber')) {
+    issues.push({
+      id: 'missing-required-fields',
+      severity: 'critical',
+      messageKey: 'aiMissingRequiredFields',
+      detail: missingFields.map((key) => fieldLabelKeysByField[key]).join(', '),
+    });
+  }
+
+  if (invalidDetails.length) {
+    issues.push({
+      id: 'invalid-check-digits',
+      severity: 'warning',
+      messageKey: 'aiInvalidCheckDigits',
+      detail: String(invalidDetails.length),
+    });
+  }
+
+  if (birthDate && !parsedBirthDate) {
+    issues.push({ id: 'invalid-birth-date', severity: 'critical', messageKey: 'aiInvalidBirthDate' });
+  }
+
+  if (parsedBirthDate) {
+    const ageYears = (now.getTime() - parsedBirthDate.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
+    if (ageYears < 0 || ageYears > 120) {
+      issues.push({ id: 'invalid-birth-age', severity: 'critical', messageKey: 'aiInvalidBirthDate' });
+    }
+  }
+
+  if (parsedExpirationDate) {
+    const daysUntilExpiry = (parsedExpirationDate.getTime() - now.getTime()) / (24 * 60 * 60 * 1000);
+    if (daysUntilExpiry < 0) {
+      issues.push({ id: 'expired-passport', severity: 'critical', messageKey: 'aiExpiredPassport' });
+    } else if (daysUntilExpiry <= 180) {
+      issues.push({ id: 'expiring-soon', severity: 'warning', messageKey: 'aiExpiringSoon' });
+    }
+  }
+
+  if (!record.rawMrz && !record.ocrText && ['done', 'needs-review', 'error'].includes(record.status)) {
+    issues.push({ id: 'no-mrz-text', severity: 'critical', messageKey: 'aiNoMrzText' });
+  }
+
+  if (/[\u0400-\u04FF]/.test(record.visualOcrText)) {
+    issues.push({ id: 'foreign-visual-text', severity: 'good', messageKey: 'aiForeignTextFound' });
+  }
+
+  if (
+    record.extractionAttempt &&
+    normalizeAngle(record.extractionAttempt.rotation - record.rotationAngle) !== 0
+  ) {
+    issues.push({
+      id: 'rotation-mismatch',
+      severity: 'warning',
+      messageKey: 'aiRotationMismatch',
+      detail: `${record.extractionAttempt.rotation} deg`,
+    });
+  }
+
+  if (record.extractionAttempt && record.extractionAttempt.score < 80 && record.valid !== true) {
+    issues.push({ id: 'low-ocr-confidence', severity: 'warning', messageKey: 'aiLowOcrConfidence' });
+  }
+
+  const criticalCount = issues.filter((issue) => issue.severity === 'critical').length;
+  const warningCount = issues.filter((issue) => issue.severity === 'warning').length;
+  let confidence =
+    record.valid === true
+      ? 94
+      : record.status === 'needs-review'
+        ? 60
+        : record.status === 'error'
+          ? 24
+          : record.status === 'processing'
+            ? 42
+            : 35;
+
+  confidence += record.extractionAttempt ? clamp(Math.round((record.extractionAttempt.score - 100) / 8), -10, 8) : 0;
+  confidence += record.visualOcrText ? 2 : 0;
+  confidence -= missingFields.length * 5;
+  confidence -= invalidDetails.length * 3;
+  confidence -= criticalCount * 10;
+  confidence -= warningCount * 5;
+  confidence -= suggestions.length ? Math.min(14, suggestions.length * 3) : 0;
+  if (criticalCount) {
+    confidence = Math.min(confidence, 54);
+  } else if (warningCount) {
+    confidence = Math.min(confidence, 84);
+  }
+  confidence = clamp(Math.round(confidence), 0, 99);
+
+  const summaryKey =
+    confidence >= 85 && criticalCount === 0
+      ? 'aiSummaryStrong'
+      : confidence >= 55 && criticalCount <= 1
+        ? 'aiSummaryReview'
+        : 'aiSummaryManual';
+
+  return { confidence, summaryKey, issues, suggestions };
+}
+
 function escapeCsv(value: unknown) {
   const text = String(value ?? '');
   if (/[",\n\r]/.test(text)) {
@@ -855,6 +1135,8 @@ async function renderPdfPagesToFiles(file: File, pageNumbers: number[]): Promise
 }
 
 function recordToExport(record: PassportRecord) {
+  const aiReview = buildAiReview(record);
+
   return {
     id: record.id,
     sourceFileName: record.sourceFileName,
@@ -874,6 +1156,7 @@ function recordToExport(record: PassportRecord) {
     })),
     ocrText: record.ocrText,
     visualOcrText: record.visualOcrText,
+    aiReview,
     error: record.error,
   };
 }
@@ -895,29 +1178,41 @@ function buildCsv(records: PassportRecord[]) {
     'expirationDateFormatted',
     'personalNumber',
     'valid',
+    'aiConfidence',
+    'aiIssues',
+    'aiSuggestions',
     'rawMrz',
     'visualOcrText',
   ];
 
-  const rows = records.map((record) => [
-    record.sourceFileName,
-    record.status,
-    record.fields.passportNumber,
-    record.fields.documentCode,
-    record.fields.issuingState,
-    record.fields.nationality,
-    record.fields.lastName,
-    record.fields.firstNames,
-    record.fields.birthDate,
-    record.normalizedFields.birthDate,
-    record.fields.sex,
-    record.fields.expirationDate,
-    record.normalizedFields.expirationDate,
-    record.fields.personalNumber,
-    record.valid ?? '',
-    record.rawMrz,
-    record.visualOcrText,
-  ]);
+  const rows = records.map((record) => {
+    const aiReview = buildAiReview(record);
+
+    return [
+      record.sourceFileName,
+      record.status,
+      record.fields.passportNumber,
+      record.fields.documentCode,
+      record.fields.issuingState,
+      record.fields.nationality,
+      record.fields.lastName,
+      record.fields.firstNames,
+      record.fields.birthDate,
+      record.normalizedFields.birthDate,
+      record.fields.sex,
+      record.fields.expirationDate,
+      record.normalizedFields.expirationDate,
+      record.fields.personalNumber,
+      record.valid ?? '',
+      aiReview.confidence,
+      aiReview.issues.map((issue) => `${issue.messageKey}${issue.detail ? `: ${issue.detail}` : ''}`).join('; '),
+      aiReview.suggestions
+        .map((suggestion) => `${suggestion.labelKey}: ${suggestion.currentValue} -> ${suggestion.suggestedValue}`)
+        .join('; '),
+      record.rawMrz,
+      record.visualOcrText,
+    ];
+  });
 
   return [headers, ...rows].map((row) => row.map(escapeCsv).join(',')).join('\n');
 }
@@ -1429,6 +1724,38 @@ function App() {
     }));
   }
 
+  function applyAiSuggestion(recordId: string, suggestion: AiSuggestion) {
+    updateField(recordId, suggestion.field, suggestion.suggestedValue);
+  }
+
+  function applyAllAiSuggestions(record: PassportRecord, suggestions: AiSuggestion[]) {
+    const eligibleSuggestions = suggestions.filter((suggestion) => suggestion.confidence >= 70);
+    if (!eligibleSuggestions.length) {
+      return;
+    }
+
+    setRecord(record.id, (current) =>
+      eligibleSuggestions.reduce(
+        (updatedRecord, suggestion) => ({
+          ...updatedRecord,
+          fields: {
+            ...updatedRecord.fields,
+            ...(suggestion.field === 'birthDate' || suggestion.field === 'expirationDate'
+              ? {}
+              : { [suggestion.field]: suggestion.suggestedValue }),
+          },
+          normalizedFields: {
+            ...updatedRecord.normalizedFields,
+            ...(suggestion.field === 'birthDate' || suggestion.field === 'expirationDate'
+              ? { [suggestion.field]: suggestion.suggestedValue }
+              : {}),
+          },
+        }),
+        current,
+      ),
+    );
+  }
+
   function updateRotation(recordId: string, angle: number) {
     setRecord(recordId, (record) => ({
       ...record,
@@ -1601,7 +1928,10 @@ function App() {
         </section>
       ) : (
         <section className="record-list" aria-label="Imported passports and extracted data">
-          {records.map((record) => (
+          {records.map((record) => {
+            const aiReview = buildAiReview(record);
+
+            return (
             <article className="record-card" key={record.id}>
               <div className="passport-panel">
                 <div className="record-header">
@@ -1730,6 +2060,84 @@ function App() {
                   </div>
                 ) : null}
 
+                <section className={`ai-panel ${aiReview.confidence >= 85 ? 'strong' : aiReview.confidence >= 55 ? 'review' : 'manual'}`}>
+                  <div className="ai-panel-header">
+                    <div>
+                      <h3>
+                        <Sparkles size={16} />
+                        {t('aiAssistant')}
+                      </h3>
+                      <p>{t('aiPrivate')}</p>
+                    </div>
+                    <strong>
+                      {aiReview.confidence}%
+                      <span>{t('aiConfidence')}</span>
+                    </strong>
+                  </div>
+                  <div className="ai-meter" aria-hidden="true">
+                    <span style={{ width: `${aiReview.confidence}%` }} />
+                  </div>
+                  <p className="ai-summary">{t(aiReview.summaryKey)}</p>
+
+                  <div className="ai-section">
+                    <div className="ai-section-header">
+                      <h4>{t('aiSuggestions')}</h4>
+                      <button
+                        type="button"
+                        className="button compact"
+                        onClick={() => applyAllAiSuggestions(record, aiReview.suggestions)}
+                        disabled={!aiReview.suggestions.length}
+                      >
+                        <Check size={15} />
+                        {t('aiApplyAll')}
+                      </button>
+                    </div>
+                    {aiReview.suggestions.length ? (
+                      <div className="ai-suggestion-list">
+                        {aiReview.suggestions.map((suggestion) => (
+                          <div className="ai-suggestion" key={suggestion.id}>
+                            <div>
+                              <strong>{t(suggestion.labelKey)}</strong>
+                              <span>
+                                {suggestion.currentValue || '-'} {t('aiSuggestionArrow')}{' '}
+                                {suggestion.suggestedValue}
+                              </span>
+                              <small>
+                                {t(suggestion.reasonKey)} · {suggestion.confidence}%
+                              </small>
+                            </div>
+                            <button
+                              type="button"
+                              className="button compact"
+                              onClick={() => applyAiSuggestion(record.id, suggestion)}
+                            >
+                              {t('aiApply')}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="ai-muted">{t('aiNoSuggestions')}</p>
+                    )}
+                  </div>
+
+                  <div className="ai-section">
+                    <h4>{t('aiChecks')}</h4>
+                    {aiReview.issues.length ? (
+                      <div className="ai-issue-list">
+                        {aiReview.issues.map((issue) => (
+                          <div className={`ai-issue ${issue.severity}`} key={issue.id}>
+                            <span>{t(issue.messageKey)}</span>
+                            {issue.detail ? <small>{issue.detail}</small> : null}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="ai-muted">{t('aiNoIssues')}</p>
+                    )}
+                  </div>
+                </section>
+
                 <div className="details-row">
                   <details>
                     <summary>
@@ -1793,7 +2201,8 @@ function App() {
                 </div>
               </div>
             </article>
-          ))}
+            );
+          })}
         </section>
       )}
 
