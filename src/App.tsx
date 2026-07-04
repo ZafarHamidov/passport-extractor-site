@@ -121,11 +121,36 @@ type LearnedCorrection = {
   from: string;
   to: string;
   createdAt: number;
+  support?: number;
+  source?: 'local' | 'shared';
 };
 
-type PendingCorrection = Pick<LearnedCorrection, 'field' | 'from' | 'to'>;
+type CorrectionFieldKey = FieldKey | 'rawMrz';
 
-type PendingCorrections = Record<string, Partial<Record<FieldKey, PendingCorrection>>>;
+type PendingCorrection = {
+  field: CorrectionFieldKey;
+  from: string;
+  to: string;
+};
+
+type PendingCorrections = Record<string, Partial<Record<CorrectionFieldKey, PendingCorrection>>>;
+
+type SharedLearningStatus = 'disabled' | 'unconfigured' | 'loading' | 'ready' | 'saving' | 'saved' | 'error';
+
+type SharedCorrectionSubmission = {
+  version: 1;
+  profileId: string;
+  profileName: string;
+  field: CorrectionFieldKey;
+  from: string;
+  to: string;
+  rawMrz: string;
+  documentCode: string;
+  issuingState: string;
+  nationality: string;
+  createdAt: string;
+  appVersion: string;
+};
 
 type PdfPageOption = {
   id: string;
@@ -261,11 +286,20 @@ const translations = {
     aiAssistant: 'AI review',
     aiPrivate: 'Local assistant. Nothing is uploaded.',
     aiTeach: 'Teach AI',
-    aiTeachHint: 'Correct fields, then save those corrections as local lessons for this browser.',
+    aiTeachHint: 'Correct fields, then save those corrections as lessons.',
     aiTeachButton: 'Learn from corrections',
     aiTeachEmpty: 'No field corrections to learn yet.',
     aiLearningSaved: 'AI lesson saved',
     aiLearnedCorrection: 'Learned from your correction.',
+    sharedLearning: 'Share corrected text/MRZ only',
+    sharedLearningHint: 'No images are uploaded. Corrected text/MRZ examples can help improve rules for future users.',
+    sharedLearningDisabled: 'Shared learning off. Saved locally only.',
+    sharedLearningUnconfigured: 'Shared learning API is not configured. Saved locally only.',
+    sharedLearningLoading: 'Loading shared rules...',
+    sharedLearningReady: 'Shared rules active.',
+    sharedLearningSaving: 'Saving shared lesson...',
+    sharedLearningSaved: 'Shared lesson saved.',
+    sharedLearningError: 'Shared learning failed. Saved locally.',
     aiConfidence: 'AI confidence',
     aiApply: 'Apply',
     aiApplyAll: 'Apply all',
@@ -393,11 +427,20 @@ const translations = {
     aiAssistant: 'AI проверка',
     aiPrivate: 'Локальный помощник. Данные не отправляются.',
     aiTeach: 'Обучить AI',
-    aiTeachHint: 'Исправьте поля и сохраните эти исправления как локальные уроки для этого браузера.',
+    aiTeachHint: 'Исправьте поля и сохраните эти исправления как уроки.',
     aiTeachButton: 'Запомнить исправления',
     aiTeachEmpty: 'Пока нет исправлений полей для обучения.',
     aiLearningSaved: 'AI урок сохранен',
     aiLearnedCorrection: 'Изучено из вашего исправления.',
+    sharedLearning: 'Отправлять только исправленный текст/MRZ',
+    sharedLearningHint: 'Изображения не загружаются. Исправленный текст/MRZ помогает улучшать правила для будущих пользователей.',
+    sharedLearningDisabled: 'Общее обучение выключено. Сохранено только локально.',
+    sharedLearningUnconfigured: 'API общего обучения не настроен. Сохранено только локально.',
+    sharedLearningLoading: 'Загрузка общих правил...',
+    sharedLearningReady: 'Общие правила активны.',
+    sharedLearningSaving: 'Сохранение общего урока...',
+    sharedLearningSaved: 'Общий урок сохранен.',
+    sharedLearningError: 'Общее обучение не сработало. Сохранено локально.',
     aiConfidence: 'Уверенность AI',
     aiApply: 'Применить',
     aiApplyAll: 'Применить все',
@@ -558,6 +601,8 @@ const mrzCropBands = [
 const mrzVariants = ['contrast', 'binary'] as const;
 
 const acceptedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const sharedLearningApiUrl = (import.meta.env.VITE_SHARED_LEARNING_API_URL ?? '').replace(/\/+$/, '');
+const appVersion = '0.1.0';
 
 function isAcceptedImage(file: File) {
   return (
@@ -660,6 +705,22 @@ function getSavedDeepScan() {
   }
 }
 
+function getSavedSharedLearningEnabled() {
+  try {
+    return window.localStorage.getItem('passport-extractor-shared-learning') === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function isFieldKey(value: CorrectionFieldKey): value is FieldKey {
+  return fieldLabels.some((field) => field.key === value);
+}
+
+function isFieldCorrection(correction: PendingCorrection): correction is PendingCorrection & { field: FieldKey } {
+  return isFieldKey(correction.field);
+}
+
 function getSavedCorrections(): LearnedCorrection[] {
   try {
     const raw = window.localStorage.getItem('passport-extractor-corrections');
@@ -680,10 +741,28 @@ function getSavedCorrections(): LearnedCorrection[] {
           typeof item.createdAt === 'number' &&
           fieldLabels.some((field) => field.key === item.field),
       )
+      .map((item) => ({
+        ...item,
+        source: item.source === 'shared' ? ('shared' as const) : ('local' as const),
+      }))
       .slice(-120);
   } catch {
     return [];
   }
+}
+
+function sharedLearningStatusKey(status: SharedLearningStatus) {
+  const statusKeys: Record<SharedLearningStatus, string> = {
+    disabled: 'sharedLearningDisabled',
+    unconfigured: 'sharedLearningUnconfigured',
+    loading: 'sharedLearningLoading',
+    ready: 'sharedLearningReady',
+    saving: 'sharedLearningSaving',
+    saved: 'sharedLearningSaved',
+    error: 'sharedLearningError',
+  };
+
+  return statusKeys[status];
 }
 
 function saveCorrections(corrections: LearnedCorrection[]) {
@@ -691,6 +770,81 @@ function saveCorrections(corrections: LearnedCorrection[]) {
     window.localStorage.setItem('passport-extractor-corrections', JSON.stringify(corrections.slice(-120)));
   } catch {
     // Learning memory is optional and stays local to this browser.
+  }
+}
+
+function sanitizeSharedText(value: string, maxLength = 500) {
+  return value.replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function buildSharedCorrectionSubmission(
+  record: PassportRecord,
+  profile: PassportProfile,
+  correction: PendingCorrection,
+): SharedCorrectionSubmission {
+  return {
+    version: 1,
+    profileId: profile.id,
+    profileName: profile.name,
+    field: correction.field,
+    from: sanitizeSharedText(correction.from),
+    to: sanitizeSharedText(correction.to),
+    rawMrz: sanitizeSharedText(record.rawMrz, 240),
+    documentCode: sanitizeSharedText(record.fields.documentCode, 24),
+    issuingState: sanitizeSharedText(record.fields.issuingState, 24),
+    nationality: sanitizeSharedText(record.fields.nationality, 24),
+    createdAt: new Date().toISOString(),
+    appVersion,
+  };
+}
+
+async function fetchSharedCorrections() {
+  if (!sharedLearningApiUrl) {
+    return [];
+  }
+
+  const response = await fetch(`${sharedLearningApiUrl}/rules`, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Shared learning rules failed: ${response.status}`);
+  }
+
+  const payload = (await response.json()) as { corrections?: LearnedCorrection[] };
+  return (payload.corrections ?? [])
+    .filter(
+      (item): item is LearnedCorrection =>
+        item &&
+        typeof item.id === 'string' &&
+        typeof item.profileId === 'string' &&
+        typeof item.field === 'string' &&
+        typeof item.from === 'string' &&
+        typeof item.to === 'string' &&
+        typeof item.createdAt === 'number' &&
+        fieldLabels.some((field) => field.key === item.field),
+    )
+    .map((item) => ({ ...item, source: 'shared' as const }))
+    .slice(-500);
+}
+
+async function submitSharedCorrections(corrections: SharedCorrectionSubmission[]) {
+  if (!sharedLearningApiUrl || !corrections.length) {
+    return;
+  }
+
+  const response = await fetch(`${sharedLearningApiUrl}/corrections`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ corrections }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Shared learning submit failed: ${response.status}`);
   }
 }
 
@@ -1912,6 +2066,11 @@ function App() {
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [cameraError, setCameraError] = useState('');
   const [learnedCorrections, setLearnedCorrections] = useState<LearnedCorrection[]>(getSavedCorrections);
+  const [sharedCorrections, setSharedCorrections] = useState<LearnedCorrection[]>([]);
+  const [sharedLearningEnabled, setSharedLearningEnabled] = useState(getSavedSharedLearningEnabled);
+  const [sharedLearningStatus, setSharedLearningStatus] = useState<SharedLearningStatus>(
+    getSavedSharedLearningEnabled() ? (sharedLearningApiUrl ? 'loading' : 'unconfigured') : 'disabled',
+  );
   const [pendingCorrections, setPendingCorrections] = useState<PendingCorrections>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -1920,7 +2079,7 @@ function App() {
   const activeRecordIdRef = useRef<string | null>(null);
   const processingChainRef = useRef(Promise.resolve());
   const recordsRef = useRef<PassportRecord[]>([]);
-  const learnedCorrectionsRef = useRef<LearnedCorrection[]>(learnedCorrections);
+  const learnedCorrectionsRef = useRef<LearnedCorrection[]>([]);
   const pdfDialogRef = useRef<PdfDialogState | null>(null);
   const isLoadingPdfRef = useRef(false);
 
@@ -1930,6 +2089,11 @@ function App() {
     const review = records.filter((record) => record.status === 'needs-review' || record.status === 'error').length;
     return { processed, valid, review, total: records.length };
   }, [records]);
+
+  const activeCorrections = useMemo(
+    () => [...learnedCorrections, ...sharedCorrections],
+    [learnedCorrections, sharedCorrections],
+  );
 
   const t = (key: string) => {
     const currentDictionary: Record<string, string> = translations[language];
@@ -1961,14 +2125,70 @@ function App() {
     });
   }
 
+  function toggleSharedLearning() {
+    setSharedLearningEnabled((current) => {
+      const next = !current;
+      try {
+        window.localStorage.setItem('passport-extractor-shared-learning', String(next));
+      } catch {
+        // Shared learning preference is optional.
+      }
+
+      if (!next) {
+        setSharedCorrections([]);
+        setSharedLearningStatus('disabled');
+      } else if (!sharedLearningApiUrl) {
+        setSharedLearningStatus('unconfigured');
+      } else {
+        setSharedLearningStatus('loading');
+      }
+
+      return next;
+    });
+  }
+
   useEffect(() => {
     recordsRef.current = records;
   }, [records]);
 
   useEffect(() => {
-    learnedCorrectionsRef.current = learnedCorrections;
     saveCorrections(learnedCorrections);
   }, [learnedCorrections]);
+
+  useEffect(() => {
+    learnedCorrectionsRef.current = activeCorrections;
+  }, [activeCorrections]);
+
+  useEffect(() => {
+    if (!sharedLearningEnabled) {
+      return;
+    }
+
+    if (!sharedLearningApiUrl) {
+      setSharedLearningStatus('unconfigured');
+      return;
+    }
+
+    let isCanceled = false;
+    setSharedLearningStatus('loading');
+    fetchSharedCorrections()
+      .then((corrections) => {
+        if (!isCanceled) {
+          setSharedCorrections(corrections);
+          setSharedLearningStatus('ready');
+        }
+      })
+      .catch(() => {
+        if (!isCanceled) {
+          setSharedCorrections([]);
+          setSharedLearningStatus('error');
+        }
+      });
+
+    return () => {
+      isCanceled = true;
+    };
+  }, [sharedLearningEnabled]);
 
   useEffect(() => {
     document.title = translations[language].appTitle;
@@ -2558,7 +2778,7 @@ function App() {
     setPendingCorrections({});
   }
 
-  function updatePendingCorrection(recordId: string, key: FieldKey, from: string, to: string) {
+  function updatePendingCorrection(recordId: string, key: CorrectionFieldKey, from: string, to: string) {
     setPendingCorrections((current) => {
       const existingRecordCorrections = current[recordId] ?? {};
       const existingCorrection = existingRecordCorrections[key];
@@ -2601,7 +2821,12 @@ function App() {
     }));
   }
 
-  function teachAiFromCorrections(record: PassportRecord) {
+  function updateRawMrz(recordId: string, value: string, previousValue: string) {
+    updatePendingCorrection(recordId, 'rawMrz', previousValue, value);
+    setRecord(recordId, (current) => ({ ...current, rawMrz: value }));
+  }
+
+  async function teachAiFromCorrections(record: PassportRecord) {
     const corrections = Object.values(pendingCorrections[record.id] ?? {}).filter(
       (correction): correction is PendingCorrection => Boolean(correction),
     );
@@ -2613,26 +2838,49 @@ function App() {
     }
 
     const profile = getPassportProfile(record);
-    const learnedItems = corrections.map((correction) => ({
-      id: crypto.randomUUID(),
-      profileId: profile.id,
-      field: correction.field,
-      from: correction.from,
-      to: correction.to,
-      createdAt: Date.now(),
-    }));
+    const learnedItems: LearnedCorrection[] = corrections
+      .filter(isFieldCorrection)
+      .map((correction) => ({
+        id: crypto.randomUUID(),
+        profileId: profile.id,
+        field: correction.field,
+        from: correction.from,
+        to: correction.to,
+        createdAt: Date.now(),
+        source: 'local' as const,
+      }));
 
-    setLearnedCorrections((current) => {
-      const replacements = new Set(
-        learnedItems.map((item) => `${item.profileId}-${item.field}-${normalizeLearnedValue(item.from)}`),
-      );
-      return [
-        ...current.filter(
-          (item) => !replacements.has(`${item.profileId}-${item.field}-${normalizeLearnedValue(item.from)}`),
-        ),
-        ...learnedItems,
-      ].slice(-120);
-    });
+    if (learnedItems.length) {
+      setLearnedCorrections((current) => {
+        const replacements = new Set(
+          learnedItems.map((item) => `${item.profileId}-${item.field}-${normalizeLearnedValue(item.from)}`),
+        );
+        return [
+          ...current.filter(
+            (item) => !replacements.has(`${item.profileId}-${item.field}-${normalizeLearnedValue(item.from)}`),
+          ),
+          ...learnedItems,
+        ].slice(-120);
+      });
+    }
+
+    if (sharedLearningEnabled && sharedLearningApiUrl) {
+      setSharedLearningStatus('saving');
+      try {
+        await submitSharedCorrections(
+          corrections.map((correction) => buildSharedCorrectionSubmission(record, profile, correction)),
+        );
+        const nextSharedCorrections = await fetchSharedCorrections();
+        setSharedCorrections(nextSharedCorrections);
+        setSharedLearningStatus('saved');
+        window.setTimeout(() => setSharedLearningStatus('ready'), 1800);
+      } catch {
+        setSharedLearningStatus('error');
+      }
+    } else if (sharedLearningEnabled && !sharedLearningApiUrl) {
+      setSharedLearningStatus('unconfigured');
+    }
+
     setPendingCorrections((current) => {
       const { [record.id]: _removed, ...rest } = current;
       return rest;
@@ -2907,7 +3155,7 @@ function App() {
       {records.length ? (
         <section className="record-list" aria-label="Imported passports and extracted data">
           {records.map((record) => {
-            const aiReview = buildAiReview(record, learnedCorrections);
+            const aiReview = buildAiReview(record, activeCorrections);
             const recordPendingCorrections = Object.values(pendingCorrections[record.id] ?? {}).filter(Boolean);
 
             return (
@@ -3024,7 +3272,7 @@ function App() {
                     <textarea
                       value={record.rawMrz}
                       onChange={(event) =>
-                        setRecord(record.id, (current) => ({ ...current, rawMrz: event.target.value }))
+                        updateRawMrz(record.id, event.target.value, record.rawMrz)
                       }
                       onClick={(event) => {
                         event.currentTarget.select();
@@ -3118,7 +3366,7 @@ function App() {
                         type="button"
                         className="button compact"
                         onClick={() => teachAiFromCorrections(record)}
-                        disabled={!recordPendingCorrections.length}
+                        disabled={!recordPendingCorrections.length || sharedLearningStatus === 'saving'}
                       >
                         <Sparkles size={15} />
                         {t('aiTeachButton')}
@@ -3126,6 +3374,20 @@ function App() {
                     </div>
                     <p className="ai-muted">
                       {recordPendingCorrections.length ? t('aiTeachHint') : t('aiTeachEmpty')}
+                    </p>
+                    <label className="shared-learning-toggle">
+                      <input
+                        type="checkbox"
+                        checked={sharedLearningEnabled}
+                        onChange={toggleSharedLearning}
+                      />
+                      <span>
+                        <strong>{t('sharedLearning')}</strong>
+                        <small>{t('sharedLearningHint')}</small>
+                      </span>
+                    </label>
+                    <p className={`shared-learning-status ${sharedLearningStatus}`}>
+                      {t(sharedLearningStatusKey(sharedLearningStatus))}
                     </p>
                   </div>
 

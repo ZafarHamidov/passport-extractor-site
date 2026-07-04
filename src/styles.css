@@ -724,6 +724,51 @@ button {
   text-transform: uppercase;
 }
 
+.shared-learning-toggle {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  align-items: flex-start;
+  padding: 9px;
+  border: 1px solid #dde5f0;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.shared-learning-toggle input {
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  accent-color: #2458d3;
+}
+
+.shared-learning-toggle span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.shared-learning-toggle strong {
+  color: #162033;
+  font-size: 0.9rem;
+}
+
+.shared-learning-toggle small,
+.shared-learning-status {
+  color: #647086;
+  font-size: 0.82rem;
+}
+
+.shared-learning-status.ready,
+.shared-learning-status.saved {
+  color: #0f766e;
+}
+
+.shared-learning-status.error,
+.shared-learning-status.unconfigured {
+  color: #9a3412;
+}
+
 .ai-meter {
   height: 7px;
   overflow: hidden;
