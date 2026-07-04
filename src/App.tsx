@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent } from 'react';
 import {
   AlertTriangle,
   Camera,
@@ -11,7 +11,6 @@ import {
   Layers,
   Languages,
   Loader2,
-  RefreshCcw,
   RotateCcw,
   RotateCw,
   Search,
@@ -94,6 +93,7 @@ type PassportRecord = {
   message: string;
   rotationAngle: number;
   previewZoom: number;
+  previewPan: PreviewPan;
   fields: ExtractedFields;
   normalizedFields: NormalizedFields;
   rawMrz: string;
@@ -109,7 +109,28 @@ type FieldKey = keyof ExtractedFields;
 
 type AppLanguage = 'en' | 'ru';
 
+type PreviewPan = {
+  x: number;
+  y: number;
+};
+
+type LearnedCorrection = {
+  id: string;
+  profileId: string;
+  field: FieldKey;
+  from: string;
+  to: string;
+  createdAt: number;
+};
+
+type PendingCorrection = Pick<LearnedCorrection, 'field' | 'from' | 'to'>;
+
+type PendingCorrections = Record<string, Partial<Record<FieldKey, PendingCorrection>>>;
+
 type PdfPageOption = {
+  id: string;
+  fileId: string;
+  fileName: string;
   pageNumber: number;
   thumbnailUrl: string;
   selected: boolean;
@@ -119,7 +140,7 @@ type PdfPageOption = {
 
 type PdfDialogState = {
   id: string;
-  file: File;
+  files: Array<{ id: string; file: File; fileName: string }>;
   fileName: string;
   pages: PdfPageOption[];
   error: string;
@@ -153,6 +174,7 @@ const translations = {
     subtitle: 'Device-only passport OCR',
     upload: 'Upload',
     camera: 'Camera',
+    donate: 'Donate',
     txt: 'TXT',
     csv: 'CSV',
     clearAll: 'Clear all',
@@ -190,6 +212,7 @@ const translations = {
     reset: 'Reset',
     zoomIn: 'Zoom in',
     zoomOut: 'Zoom out',
+    panToMove: 'Drag to move, use wheel or touchpad to zoom',
     rotation: 'Rotation',
     dragToRotate: 'Drag to rotate',
     passportNumber: 'Passport number',
@@ -237,6 +260,12 @@ const translations = {
     extractionAttemptPrefix: 'Best attempt',
     aiAssistant: 'AI review',
     aiPrivate: 'Local assistant. Nothing is uploaded.',
+    aiTeach: 'Teach AI',
+    aiTeachHint: 'Correct fields, then save those corrections as local lessons for this browser.',
+    aiTeachButton: 'Learn from corrections',
+    aiTeachEmpty: 'No field corrections to learn yet.',
+    aiLearningSaved: 'AI lesson saved',
+    aiLearnedCorrection: 'Learned from your correction.',
     aiConfidence: 'AI confidence',
     aiApply: 'Apply',
     aiApplyAll: 'Apply all',
@@ -271,13 +300,14 @@ const translations = {
     languageCurrentRussian: 'Language: Russian',
     capturePhoto: 'Capture photo',
     closeCamera: 'Close camera',
-    cameraUnavailable: 'Camera is unavailable. Falling back to file upload.',
+    cameraUnavailable: 'Camera is unavailable or blocked. Allow camera access in the browser and try again.',
   },
   ru: {
-    appTitle: 'Паспортный экстрактор Zafar',
+    appTitle: 'Паспортный экстрактор Зафара',
     subtitle: 'OCR паспорта только на устройстве',
     upload: 'Загрузить',
     camera: 'Камера',
+    donate: 'Поддержать',
     txt: 'TXT',
     csv: 'CSV',
     clearAll: 'Очистить',
@@ -315,6 +345,7 @@ const translations = {
     reset: 'Сброс',
     zoomIn: 'Приблизить',
     zoomOut: 'Отдалить',
+    panToMove: 'Тяните для перемещения, колесо или тачпад для масштаба',
     rotation: 'Поворот',
     dragToRotate: 'Тяните для поворота',
     passportNumber: 'Номер паспорта',
@@ -361,6 +392,12 @@ const translations = {
     languageToggle: 'EN',
     aiAssistant: 'AI проверка',
     aiPrivate: 'Локальный помощник. Данные не отправляются.',
+    aiTeach: 'Обучить AI',
+    aiTeachHint: 'Исправьте поля и сохраните эти исправления как локальные уроки для этого браузера.',
+    aiTeachButton: 'Запомнить исправления',
+    aiTeachEmpty: 'Пока нет исправлений полей для обучения.',
+    aiLearningSaved: 'AI урок сохранен',
+    aiLearnedCorrection: 'Изучено из вашего исправления.',
     aiConfidence: 'Уверенность AI',
     aiApply: 'Применить',
     aiApplyAll: 'Применить все',
@@ -395,7 +432,7 @@ const translations = {
     languageCurrentRussian: 'Язык: русский',
     capturePhoto: 'Сделать фото',
     closeCamera: 'Закрыть камеру',
-    cameraUnavailable: 'Камера недоступна. Открываем загрузку файла.',
+    cameraUnavailable: 'Камера недоступна или заблокирована. Разрешите доступ к камере в браузере и попробуйте снова.',
     extractionAttemptPrefix: 'Лучшая попытка',
   },
 } satisfies Record<AppLanguage, Record<string, string>>;
@@ -546,6 +583,7 @@ function createRecord(file: File, sourceFileName = file.name || 'camera-capture.
     message: 'Waiting',
     rotationAngle: 0,
     previewZoom: 1,
+    previewPan: { x: 0, y: 0 },
     fields: { ...emptyFields },
     normalizedFields: { ...emptyNormalizedFields },
     rawMrz: '',
@@ -596,6 +634,15 @@ function updateRecordById(
   return records.map((record) => (record.id === id ? updater(record) : record));
 }
 
+function getTransferFiles(dataTransfer: DataTransfer) {
+  const itemFiles = Array.from(dataTransfer.items ?? [])
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file));
+
+  return itemFiles.length ? itemFiles : Array.from(dataTransfer.files);
+}
+
 function getSavedLanguage(): AppLanguage {
   try {
     const saved = window.localStorage.getItem('passport-extractor-language');
@@ -610,6 +657,40 @@ function getSavedDeepScan() {
     return window.localStorage.getItem('passport-extractor-deep-scan') === 'true';
   } catch {
     return false;
+  }
+}
+
+function getSavedCorrections(): LearnedCorrection[] {
+  try {
+    const raw = window.localStorage.getItem('passport-extractor-corrections');
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed
+      .filter(
+        (item): item is LearnedCorrection =>
+          item &&
+          typeof item.id === 'string' &&
+          typeof item.profileId === 'string' &&
+          typeof item.field === 'string' &&
+          typeof item.from === 'string' &&
+          typeof item.to === 'string' &&
+          typeof item.createdAt === 'number' &&
+          fieldLabels.some((field) => field.key === item.field),
+      )
+      .slice(-120);
+  } catch {
+    return [];
+  }
+}
+
+function saveCorrections(corrections: LearnedCorrection[]) {
+  try {
+    window.localStorage.setItem('passport-extractor-corrections', JSON.stringify(corrections.slice(-120)));
+  } catch {
+    // Learning memory is optional and stays local to this browser.
   }
 }
 
@@ -738,6 +819,44 @@ function getDisplayField(record: PassportRecord, key: FieldKey) {
   }
 
   return record.fields[key];
+}
+
+function normalizeLearnedValue(value: string) {
+  return value.trim().replace(/\s+/g, ' ').toUpperCase();
+}
+
+function applyLearnedCorrections(record: PassportRecord, corrections: LearnedCorrection[]) {
+  const profile = getPassportProfile(record);
+  const relevantCorrections = corrections.filter(
+    (correction) => correction.profileId === profile.id || correction.profileId === 'GENERIC',
+  );
+
+  if (!relevantCorrections.length) {
+    return record;
+  }
+
+  return relevantCorrections.reduce((updatedRecord, correction) => {
+    const currentValue = getDisplayField(updatedRecord, correction.field);
+    if (!currentValue || normalizeLearnedValue(currentValue) !== normalizeLearnedValue(correction.from)) {
+      return updatedRecord;
+    }
+
+    return {
+      ...updatedRecord,
+      fields: {
+        ...updatedRecord.fields,
+        ...(correction.field === 'birthDate' || correction.field === 'dateOfIssue' || correction.field === 'expirationDate'
+          ? {}
+          : { [correction.field]: correction.to }),
+      },
+      normalizedFields: {
+        ...updatedRecord.normalizedFields,
+        ...(correction.field === 'birthDate' || correction.field === 'dateOfIssue' || correction.field === 'expirationDate'
+          ? { [correction.field]: correction.to }
+          : {}),
+      },
+    };
+  }, record);
 }
 
 function translateRecordMessage(message: string, t: (key: string) => string) {
@@ -1145,6 +1264,7 @@ function mergeVisibleFields(record: PassportRecord, visibleFields: Partial<Extra
   }
 
   return {
+    ...record,
     fields: nextFields,
     normalizedFields: normalizedFieldsFromExtracted(nextFields),
   };
@@ -1236,9 +1356,54 @@ function buildMrzFieldSuggestions(record: PassportRecord): AiSuggestion[] {
   });
 }
 
-function buildAiReview(record: PassportRecord): AiReview {
+function buildLearnedFieldSuggestions(record: PassportRecord, corrections: LearnedCorrection[]): AiSuggestion[] {
+  const profile = getPassportProfile(record);
+  const relevantCorrections = corrections.filter(
+    (correction) => correction.profileId === profile.id || correction.profileId === 'GENERIC',
+  );
+
+  return relevantCorrections.flatMap((correction) => {
+    const currentValue = getAiFieldValue(record, correction.field);
+    if (
+      !currentValue ||
+      normalizeLearnedValue(currentValue) !== normalizeLearnedValue(correction.from) ||
+      normalizeLearnedValue(currentValue) === normalizeLearnedValue(correction.to)
+    ) {
+      return [];
+    }
+
+    return [
+      {
+        id: `learned-${correction.id}`,
+        field: correction.field,
+        labelKey: fieldLabelKeysByField[correction.field],
+        suggestedValue: correction.to,
+        currentValue,
+        reasonKey: 'aiLearnedCorrection',
+        confidence: 96,
+      },
+    ];
+  });
+}
+
+function uniqueAiSuggestions(suggestions: AiSuggestion[]) {
+  const seen = new Set<string>();
+  return suggestions.filter((suggestion) => {
+    const key = `${suggestion.field}-${normalizeLearnedValue(suggestion.suggestedValue)}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildAiReview(record: PassportRecord, corrections: LearnedCorrection[] = []): AiReview {
   const issues: AiIssue[] = [];
-  const suggestions = buildMrzFieldSuggestions(record);
+  const suggestions = uniqueAiSuggestions([
+    ...buildLearnedFieldSuggestions(record, corrections),
+    ...buildMrzFieldSuggestions(record),
+  ]);
   const missingFields = requiredTravelFields.filter((key) => !getAiFieldValue(record, key));
   const invalidDetails = record.validationDetails.filter((detail) => !detail.valid);
   const passportNumber = getAiFieldValue(record, 'passportNumber');
@@ -1518,11 +1683,12 @@ async function getPdfPageText(page: pdfjsLib.PDFPageProxy) {
   }
 }
 
-async function renderPdfThumbnails(file: File) {
+async function renderPdfThumbnails(file: File, fileId: string) {
   const data = new Uint8Array(await file.arrayBuffer());
   const loadingTask = pdfjsLib.getDocument({ data });
   const document = await loadingTask.promise;
   const pages: PdfPageOption[] = [];
+  const fileName = file.name || 'passport.pdf';
 
   try {
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
@@ -1534,6 +1700,9 @@ async function renderPdfThumbnails(file: File) {
 
       await page.render({ canvas, canvasContext: context, viewport }).promise;
       pages.push({
+        id: `${fileId}-${pageNumber}`,
+        fileId,
+        fileName,
         pageNumber,
         thumbnailUrl: canvas.toDataURL('image/jpeg', 0.78),
         selected: true,
@@ -1740,17 +1909,19 @@ function App() {
   const [isImportingPdf, setIsImportingPdf] = useState(false);
   const [visualOcrRecordIds, setVisualOcrRecordIds] = useState<Set<string>>(() => new Set());
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [cameraError, setCameraError] = useState('');
+  const [learnedCorrections, setLearnedCorrections] = useState<LearnedCorrection[]>(getSavedCorrections);
+  const [pendingCorrections, setPendingCorrections] = useState<PendingCorrections>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const cameraInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const workerRef = useRef<Tesseract.Worker | null>(null);
   const visualWorkerRef = useRef<Tesseract.Worker | null>(null);
   const activeRecordIdRef = useRef<string | null>(null);
   const processingChainRef = useRef(Promise.resolve());
   const recordsRef = useRef<PassportRecord[]>([]);
+  const learnedCorrectionsRef = useRef<LearnedCorrection[]>(learnedCorrections);
   const pdfDialogRef = useRef<PdfDialogState | null>(null);
-  const pdfQueueRef = useRef<File[]>([]);
   const isLoadingPdfRef = useRef(false);
 
   const stats = useMemo(() => {
@@ -1793,6 +1964,11 @@ function App() {
   useEffect(() => {
     recordsRef.current = records;
   }, [records]);
+
+  useEffect(() => {
+    learnedCorrectionsRef.current = learnedCorrections;
+    saveCorrections(learnedCorrections);
+  }, [learnedCorrections]);
 
   useEffect(() => {
     document.title = translations[language].appTitle;
@@ -2010,17 +2186,21 @@ function App() {
 
       if (!parsed) {
         const embeddedVisibleFields = record.embeddedText ? extractVisibleFields(record.embeddedText) : {};
-        setRecord(record.id, (current) => ({
-          ...current,
-          status: 'needs-review',
-          progress: 100,
-          message: 'Manual review',
-          ...mergeVisibleFields(current, embeddedVisibleFields),
-          ocrText: extraction.ocrText,
-          extractionAttempt: extraction.attempt,
-          valid: false,
-          error: 'No valid TD3 passport MRZ candidate was found.',
-        }));
+        setRecord(record.id, (current) => {
+          const visibleMerged = mergeVisibleFields(current, embeddedVisibleFields);
+          const learnedMerged = applyLearnedCorrections(visibleMerged, learnedCorrectionsRef.current);
+
+          return {
+            ...learnedMerged,
+            status: 'needs-review',
+            progress: 100,
+            message: 'Manual review',
+            ocrText: extraction.ocrText,
+            extractionAttempt: extraction.attempt,
+            valid: false,
+            error: 'No valid TD3 passport MRZ candidate was found.',
+          };
+        });
         return;
       }
 
@@ -2037,12 +2217,10 @@ function App() {
         visibleFields,
       );
       setRecord(record.id, (current) => ({
-        ...current,
+        ...applyLearnedCorrections({ ...current, ...visibleMerge }, learnedCorrectionsRef.current),
         status: parsed.result.valid ? 'done' : 'needs-review',
         progress: 100,
         message: parsed.result.valid ? 'Extracted' : 'Check fields',
-        fields: visibleMerge.fields,
-        normalizedFields: visibleMerge.normalizedFields,
         rawMrz: parsed.lines.join('\n'),
         valid: parsed.result.valid,
         validationDetails,
@@ -2072,11 +2250,12 @@ function App() {
     setVisualOcrRecordIds((current) => new Set(current).add(record.id));
     try {
       const visualOcrText = await runVisualOcr(record);
-      setRecord(record.id, (current) => ({
-        ...current,
-        visualOcrText,
-        ...mergeVisibleFields(current, extractVisibleFields(visualOcrText, getPassportProfile(current))),
-      }));
+      setRecord(record.id, (current) =>
+        mergeVisibleFields(
+          { ...current, visualOcrText },
+          extractVisibleFields(visualOcrText, getPassportProfile(current)),
+        ),
+      );
     } catch {
       setCopiedLabel(t('ocrFailed'));
       window.setTimeout(() => setCopiedLabel(''), 1400);
@@ -2099,49 +2278,51 @@ function App() {
       .catch(() => undefined);
   }
 
-  async function loadNextPdfFromQueue() {
-    if (isLoadingPdfRef.current || pdfDialogRef.current) {
+  async function openPdfBatchDialog(files: File[]) {
+    if (isLoadingPdfRef.current) {
       return;
     }
 
-    const file = pdfQueueRef.current.shift();
-    if (!file) {
-      setPdfImportMessage('');
-      return;
-    }
+    const pdfFiles = files.map((file) => ({
+      id: crypto.randomUUID(),
+      file,
+      fileName: file.name || 'passport.pdf',
+    }));
+    const pages: PdfPageOption[] = [];
+    const errors: string[] = [];
 
     isLoadingPdfRef.current = true;
-    setPdfImportMessage(`${t('preparingPdf')}: ${file.name || 'PDF'}`);
-    let shouldContinueQueue = false;
+    setPdfImportMessage(`${t('preparingPdf')}: ${pdfFiles.length}`);
 
     try {
-      const pages = await renderPdfThumbnails(file);
+      for (const pdfFile of pdfFiles) {
+        setPdfImportMessage(`${t('preparingPdf')}: ${pdfFile.fileName}`);
+        try {
+          pages.push(...(await renderPdfThumbnails(pdfFile.file, pdfFile.id)));
+        } catch (error) {
+          errors.push(`${pdfFile.fileName}: ${error instanceof Error ? error.message : t('pdfFailed')}`);
+        }
+      }
+
+      if (!pages.length) {
+        setCopiedLabel(errors.length ? `${t('pdfFailed')}: ${errors.join('; ')}` : t('pdfFailed'));
+        window.setTimeout(() => setCopiedLabel(''), 3000);
+        return;
+      }
+
       const nextDialog: PdfDialogState = {
         id: crypto.randomUUID(),
-        file,
-        fileName: file.name || 'passport.pdf',
+        files: pdfFiles,
+        fileName: pdfFiles.length === 1 ? pdfFiles[0].fileName : `${pdfFiles.length} PDFs`,
         pages,
-        error: '',
+        error: errors.join('\n'),
       };
       pdfDialogRef.current = nextDialog;
       setPdfDialog(nextDialog);
-      setPdfImportMessage('');
-    } catch (error) {
-      setCopiedLabel(error instanceof Error ? `${t('pdfFailed')}: ${error.message}` : t('pdfFailed'));
-      window.setTimeout(() => setCopiedLabel(''), 2500);
-      setPdfImportMessage('');
-      shouldContinueQueue = true;
     } finally {
       isLoadingPdfRef.current = false;
-      if (shouldContinueQueue) {
-        void loadNextPdfFromQueue();
-      }
+      setPdfImportMessage('');
     }
-  }
-
-  function enqueuePdfFiles(files: File[]) {
-    pdfQueueRef.current.push(...files);
-    void loadNextPdfFromQueue();
   }
 
   function closePdfDialog() {
@@ -2149,12 +2330,9 @@ function App() {
     pdfDialogRef.current = null;
     setPdfDialog(null);
     setPdfImportMessage('');
-    window.setTimeout(() => {
-      void loadNextPdfFromQueue();
-    }, 0);
   }
 
-  function togglePdfPage(pageNumber: number) {
+  function togglePdfPage(pageId: string) {
     setPdfDialog((current) => {
       if (!current) {
         return current;
@@ -2164,7 +2342,7 @@ function App() {
         ...current,
         error: '',
         pages: current.pages.map((page) =>
-          page.pageNumber === pageNumber ? { ...page, selected: !page.selected } : page,
+          page.id === pageId ? { ...page, selected: !page.selected } : page,
         ),
       };
     });
@@ -2187,7 +2365,7 @@ function App() {
       return;
     }
 
-    const selectedPages = pdfDialog.pages.filter((page) => page.selected).map((page) => page.pageNumber);
+    const selectedPages = pdfDialog.pages.filter((page) => page.selected);
 
     if (!selectedPages.length) {
       setPdfDialog((current) => (current ? { ...current, error: 'Select at least one page to import.' } : current));
@@ -2198,7 +2376,18 @@ function App() {
     setPdfImportMessage(`${t('rendering')} ${selectedPages.length}`);
 
     try {
-      const renderedPages = await renderPdfPagesToFiles(pdfDialog.file, selectedPages);
+      const renderedPages: RenderedPdfPage[] = [];
+
+      for (const pdfFile of pdfDialog.files) {
+        const pageNumbers = selectedPages
+          .filter((page) => page.fileId === pdfFile.id)
+          .map((page) => page.pageNumber);
+
+        if (pageNumbers.length) {
+          renderedPages.push(...(await renderPdfPagesToFiles(pdfFile.file, pageNumbers)));
+        }
+      }
+
       const nextRecords = renderedPages.map((page) => createRecord(page.file, page.sourceFileName, page.embeddedText));
 
       if (nextRecords.length) {
@@ -2240,40 +2429,69 @@ function App() {
     }
 
     if (pdfFiles.length) {
-      enqueuePdfFiles(pdfFiles);
+      void openPdfBatchDialog(pdfFiles);
     }
   }
 
-  async function openCameraCapture() {
+  async function requestCameraStream() {
     if (!navigator.mediaDevices?.getUserMedia) {
-      setCopiedLabel(t('cameraUnavailable'));
-      window.setTimeout(() => setCopiedLabel(''), 1800);
-      cameraInputRef.current?.click();
-      return;
+      throw new Error(t('cameraUnavailable'));
     }
 
-    setCameraError('');
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+    const attempts: MediaStreamConstraints[] = [
+      {
         audio: false,
         video: {
           facingMode: { ideal: 'environment' },
           width: { ideal: 1600 },
           height: { ideal: 1000 },
         },
-      });
+      },
+      {
+        audio: false,
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+      },
+      {
+        audio: false,
+        video: true,
+      },
+    ];
+
+    let lastError: unknown;
+    for (const constraints of attempts) {
+      try {
+        return await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(t('cameraUnavailable'));
+  }
+
+  async function openCameraCapture() {
+    cameraStream?.getTracks().forEach((track) => track.stop());
+    setCameraStream(null);
+    setIsCameraOpen(true);
+    setCameraError('');
+
+    try {
+      const stream = await requestCameraStream();
       setCameraStream(stream);
-    } catch {
-      setCameraError(t('cameraUnavailable'));
+    } catch (error) {
+      setCameraError(error instanceof Error && error.name ? `${t('cameraUnavailable')} (${error.name})` : t('cameraUnavailable'));
       setCopiedLabel(t('cameraUnavailable'));
       window.setTimeout(() => setCopiedLabel(''), 1800);
-      cameraInputRef.current?.click();
     }
   }
 
   function closeCameraCapture() {
     cameraStream?.getTracks().forEach((track) => track.stop());
     setCameraStream(null);
+    setIsCameraOpen(false);
     setCameraError('');
   }
 
@@ -2318,20 +2536,58 @@ function App() {
       error: '',
     };
     setRecords((current) => updateRecordById(current, record.id, () => retryVersion));
+    setPendingCorrections((current) => {
+      const { [record.id]: _removed, ...rest } = current;
+      return rest;
+    });
     queueRecords([retryVersion]);
   }
 
   function removeRecord(record: PassportRecord) {
     URL.revokeObjectURL(record.previewUrl);
     setRecords((current) => current.filter((item) => item.id !== record.id));
+    setPendingCorrections((current) => {
+      const { [record.id]: _removed, ...rest } = current;
+      return rest;
+    });
   }
 
   function clearAll() {
     records.forEach((record) => URL.revokeObjectURL(record.previewUrl));
     setRecords([]);
+    setPendingCorrections({});
   }
 
-  function updateField(recordId: string, key: FieldKey, value: string) {
+  function updatePendingCorrection(recordId: string, key: FieldKey, from: string, to: string) {
+    setPendingCorrections((current) => {
+      const existingRecordCorrections = current[recordId] ?? {};
+      const existingCorrection = existingRecordCorrections[key];
+      const originalValue = existingCorrection?.from ?? from;
+      const nextRecordCorrections = { ...existingRecordCorrections };
+
+      if (!originalValue.trim() || normalizeLearnedValue(originalValue) === normalizeLearnedValue(to)) {
+        delete nextRecordCorrections[key];
+      } else {
+        nextRecordCorrections[key] = { field: key, from: originalValue, to };
+      }
+
+      if (!Object.keys(nextRecordCorrections).length) {
+        const { [recordId]: _removed, ...rest } = current;
+        return rest;
+      }
+
+      return {
+        ...current,
+        [recordId]: nextRecordCorrections,
+      };
+    });
+  }
+
+  function updateField(recordId: string, key: FieldKey, value: string, previousValue?: string) {
+    if (previousValue !== undefined) {
+      updatePendingCorrection(recordId, key, previousValue, value);
+    }
+
     setRecord(recordId, (record) => ({
       ...record,
       fields: {
@@ -2343,6 +2599,46 @@ function App() {
         ...(key === 'birthDate' || key === 'dateOfIssue' || key === 'expirationDate' ? { [key]: value } : {}),
       },
     }));
+  }
+
+  function teachAiFromCorrections(record: PassportRecord) {
+    const corrections = Object.values(pendingCorrections[record.id] ?? {}).filter(
+      (correction): correction is PendingCorrection => Boolean(correction),
+    );
+
+    if (!corrections.length) {
+      setCopiedLabel(t('aiTeachEmpty'));
+      window.setTimeout(() => setCopiedLabel(''), 1600);
+      return;
+    }
+
+    const profile = getPassportProfile(record);
+    const learnedItems = corrections.map((correction) => ({
+      id: crypto.randomUUID(),
+      profileId: profile.id,
+      field: correction.field,
+      from: correction.from,
+      to: correction.to,
+      createdAt: Date.now(),
+    }));
+
+    setLearnedCorrections((current) => {
+      const replacements = new Set(
+        learnedItems.map((item) => `${item.profileId}-${item.field}-${normalizeLearnedValue(item.from)}`),
+      );
+      return [
+        ...current.filter(
+          (item) => !replacements.has(`${item.profileId}-${item.field}-${normalizeLearnedValue(item.from)}`),
+        ),
+        ...learnedItems,
+      ].slice(-120);
+    });
+    setPendingCorrections((current) => {
+      const { [record.id]: _removed, ...rest } = current;
+      return rest;
+    });
+    setCopiedLabel(t('aiLearningSaved'));
+    window.setTimeout(() => setCopiedLabel(''), 1600);
   }
 
   function applyAiSuggestion(recordId: string, suggestion: AiSuggestion) {
@@ -2387,8 +2683,57 @@ function App() {
   function updateZoom(recordId: string, delta: number) {
     setRecord(recordId, (record) => ({
       ...record,
-      previewZoom: Math.min(3, Math.max(0.6, Number((record.previewZoom + delta).toFixed(2)))),
+      previewZoom: Math.min(5, Math.max(0.35, Number((record.previewZoom + delta).toFixed(2)))),
     }));
+  }
+
+  function resetPreview(recordId: string) {
+    setRecord(recordId, (record) => ({
+      ...record,
+      rotationAngle: 0,
+      previewZoom: 1,
+      previewPan: { x: 0, y: 0 },
+    }));
+  }
+
+  function zoomPreviewWithWheel(recordId: string, event: ReactWheelEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const delta = Math.max(-0.35, Math.min(0.35, -event.deltaY * 0.0018));
+
+    setRecord(recordId, (record) => ({
+      ...record,
+      previewZoom: Math.min(5, Math.max(0.35, Number((record.previewZoom + delta).toFixed(2)))),
+    }));
+  }
+
+  function startPreviewPan(record: PassportRecord, event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0 && event.pointerType === 'mouse') {
+      return;
+    }
+
+    event.preventDefault();
+    const element = event.currentTarget;
+    const startPoint = { x: event.clientX, y: event.clientY };
+    const startPan = { ...record.previewPan };
+    element.setPointerCapture(event.pointerId);
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      setRecord(record.id, (current) => ({
+        ...current,
+        previewPan: {
+          x: startPan.x + moveEvent.clientX - startPoint.x,
+          y: startPan.y + moveEvent.clientY - startPoint.y,
+        },
+      }));
+    };
+
+    const handlePointerUp = () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
   }
 
   function startRotationDrag(record: PassportRecord, event: ReactPointerEvent<HTMLButtonElement>) {
@@ -2467,19 +2812,6 @@ function App() {
               }
             }}
           />
-          <input
-            ref={cameraInputRef}
-            className="hidden-input"
-            type="file"
-            accept="image/*"
-            capture="environment"
-            onChange={(event) => {
-              if (event.target.files) {
-                addFiles(event.target.files);
-                event.target.value = '';
-              }
-            }}
-          />
           <button className="button primary" type="button" onClick={() => fileInputRef.current?.click()}>
             <Upload size={17} />
             {t('upload')}
@@ -2488,6 +2820,15 @@ function App() {
             <Camera size={17} />
             {t('camera')}
           </button>
+          <a
+            className="button donate-button"
+            href="https://www.tbank.ru/cf/2k4rg2TI0ie"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <span className="tbank-mark" aria-hidden="true">T</span>
+            {t('donate')}
+          </a>
           <button
             className={`button ${isDeepScan ? 'active' : ''}`}
             type="button"
@@ -2516,47 +2857,58 @@ function App() {
       </section>
 
       <section
-        className={`drop-zone ${isDragging ? 'dragging' : ''}`}
+        className={`drop-zone ${isDragging ? 'dragging' : ''} ${records.length ? '' : 'empty-upload'}`}
+        role="button"
+        tabIndex={0}
+        onClick={() => fileInputRef.current?.click()}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            fileInputRef.current?.click();
+          }
+        }}
         onDragOver={(event) => {
           event.preventDefault();
+          event.dataTransfer.dropEffect = 'copy';
           setIsDragging(true);
         }}
         onDragLeave={() => setIsDragging(false)}
         onDrop={(event) => {
           event.preventDefault();
           setIsDragging(false);
-          addFiles(event.dataTransfer.files);
+          addFiles(getTransferFiles(event.dataTransfer));
         }}
       >
-        <ImagePlus size={24} />
+        {records.length ? <ImagePlus size={24} /> : <Clipboard size={32} />}
         <div>
-          <strong>{t('dropTitle')}</strong>
-          <span>{t('dropFormats')}</span>
+          <strong>{records.length ? t('dropTitle') : t('noPassports')}</strong>
+          <span>{records.length ? t('dropFormats') : t('emptyHint')}</span>
         </div>
-        <div className="stats">
-          <span>
-            {stats.total} {t('total')}
-          </span>
-          <span>
-            {stats.valid} {t('valid')}
-          </span>
-          <span>
-            {stats.review} {t('review')}
-          </span>
-          {pdfImportMessage ? <span>{pdfImportMessage}</span> : null}
-        </div>
+        {records.length || pdfImportMessage ? (
+          <div className="stats">
+            {records.length ? (
+              <>
+                <span>
+                  {stats.total} {t('total')}
+                </span>
+                <span>
+                  {stats.valid} {t('valid')}
+                </span>
+                <span>
+                  {stats.review} {t('review')}
+                </span>
+              </>
+            ) : null}
+            {pdfImportMessage ? <span>{pdfImportMessage}</span> : null}
+          </div>
+        ) : null}
       </section>
 
-      {records.length === 0 ? (
-        <button className="empty-state empty-state-button" type="button" onClick={() => fileInputRef.current?.click()}>
-          <Clipboard size={30} />
-          <h2>{t('noPassports')}</h2>
-          <p>{t('emptyHint')}</p>
-        </button>
-      ) : (
+      {records.length ? (
         <section className="record-list" aria-label="Imported passports and extracted data">
           {records.map((record) => {
-            const aiReview = buildAiReview(record);
+            const aiReview = buildAiReview(record, learnedCorrections);
+            const recordPendingCorrections = Object.values(pendingCorrections[record.id] ?? {}).filter(Boolean);
 
             return (
             <article className="record-card" key={record.id}>
@@ -2571,32 +2923,32 @@ function App() {
                     {statusLabel(record.status, t)}
                   </span>
                 </div>
-                <div className="image-frame">
-                  <div className="image-rotator" style={{ transform: `rotate(${record.rotationAngle}deg)` }}>
+                <div
+                  className="image-frame"
+                  role="button"
+                  tabIndex={0}
+                  title={t('panToMove')}
+                  onPointerDown={(event) => startPreviewPan(record, event)}
+                  onWheel={(event) => zoomPreviewWithWheel(record.id, event)}
+                >
+                  <div
+                    className="image-rotator"
+                    style={{
+                      transform: `translate(calc(-50% + ${record.previewPan.x}px), calc(-50% + ${record.previewPan.y}px)) rotate(${record.rotationAngle}deg) scale(${record.previewZoom})`,
+                    }}
+                  >
                     <img
                       src={record.previewUrl}
                       alt={`Imported passport ${record.sourceFileName}`}
-                      style={{ width: `${Math.round(record.previewZoom * 100)}%` }}
+                      draggable={false}
                     />
                   </div>
+                  <span className="image-hint">{t('panToMove')}</span>
                 </div>
                 <div className="record-tools">
                   <button className="button compact" type="button" onClick={() => retryRecord(record)}>
-                    <RefreshCcw size={15} />
-                    {t('retry')}
-                  </button>
-                  <button className="button compact" type="button" onClick={() => retryRecord(record)}>
                     <Search size={15} />
                     {t('reextract')}
-                  </button>
-                  <button
-                    className="button compact"
-                    type="button"
-                    onClick={() => readVisualText(record)}
-                    disabled={visualOcrRecordIds.has(record.id)}
-                  >
-                    {visualOcrRecordIds.has(record.id) ? <Loader2 size={15} className="spin" /> : <Languages size={15} />}
-                    {visualOcrRecordIds.has(record.id) ? t('visualOcrRunning') : t('visualOcrButton')}
                   </button>
                   <button className="icon-button" type="button" onClick={() => updateRotation(record.id, record.rotationAngle - 90)} title={t('rotateLeft')}>
                     <RotateCcw size={16} />
@@ -2607,7 +2959,7 @@ function App() {
                   <button className="button compact" type="button" onClick={() => updateRotation(record.id, record.rotationAngle + 180)}>
                     {t('rotateHalf')}
                   </button>
-                  <button className="button compact" type="button" onClick={() => updateRotation(record.id, 0)}>
+                  <button className="button compact" type="button" onClick={() => resetPreview(record.id)}>
                     {t('reset')}
                   </button>
                   <button className="icon-button" type="button" onClick={() => updateZoom(record.id, -0.2)} title={t('zoomOut')}>
@@ -2644,7 +2996,9 @@ function App() {
                       <div className="input-shell">
                         <input
                           value={getDisplayField(record, field.key)}
-                          onChange={(event) => updateField(record.id, field.key, event.target.value)}
+                          onChange={(event) =>
+                            updateField(record.id, field.key, event.target.value, getDisplayField(record, field.key))
+                          }
                           onClick={(event) => {
                             event.currentTarget.select();
                             void copyValue(t(field.labelKey), event.currentTarget.value);
@@ -2758,6 +3112,24 @@ function App() {
                   </div>
 
                   <div className="ai-section">
+                    <div className="ai-section-header">
+                      <h4>{t('aiTeach')}</h4>
+                      <button
+                        type="button"
+                        className="button compact"
+                        onClick={() => teachAiFromCorrections(record)}
+                        disabled={!recordPendingCorrections.length}
+                      >
+                        <Sparkles size={15} />
+                        {t('aiTeachButton')}
+                      </button>
+                    </div>
+                    <p className="ai-muted">
+                      {recordPendingCorrections.length ? t('aiTeachHint') : t('aiTeachEmpty')}
+                    </p>
+                  </div>
+
+                  <div className="ai-section">
                     <h4>{t('aiChecks')}</h4>
                     {aiReview.issues.length ? (
                       <div className="ai-issue-list">
@@ -2773,76 +3145,14 @@ function App() {
                     )}
                   </div>
                 </section>
-
-                <div className="details-row">
-                  <details>
-                    <summary>
-                      <Check size={15} />
-                      {t('validationDetails')}
-                    </summary>
-                    <div className="detail-list">
-                      {record.validationDetails.length ? (
-                        record.validationDetails.map((detail, index) => (
-                          <div className="detail-item" key={`${detail.label}-${index}`}>
-                            <span>{detail.label}</span>
-                            <strong className={detail.valid ? 'valid-text' : 'invalid-text'}>
-                              {detail.valid ? t('validLabel') : detail.error || t('invalidLabel')}
-                            </strong>
-                          </div>
-                        ))
-                      ) : (
-                        <p>{t('noValidation')}</p>
-                      )}
-                    </div>
-                  </details>
-
-                  <details>
-                    <summary>
-                      <Clipboard size={15} />
-                      {t('ocrText')}
-                    </summary>
-                    <pre>{record.ocrText || t('noOcrText')}</pre>
-                  </details>
-
-                  <details>
-                    <summary>
-                      <Languages size={15} />
-                      {t('visualText')}
-                    </summary>
-                    <div className="copyable-pre">
-                      <pre>{record.visualOcrText || t('noVisualText')}</pre>
-                      <button
-                        type="button"
-                        className="button compact"
-                        onClick={() => copyValue(t('visualText'), record.visualOcrText)}
-                        disabled={!record.visualOcrText}
-                      >
-                        <Clipboard size={15} />
-                        {t('visualText')}
-                      </button>
-                    </div>
-                  </details>
-
-                  <details>
-                    <summary>
-                      <Search size={15} />
-                      {t('extractionDetails')}
-                    </summary>
-                    <pre>
-                      {record.extractionAttempt
-                        ? `${t('extractionAttemptPrefix')}: ${record.extractionAttempt.rotation}°, ${record.extractionAttempt.crop}, ${record.extractionAttempt.variant}, score ${record.extractionAttempt.score}, candidates ${record.extractionAttempt.candidateCount}`
-                        : t('noOcrText')}
-                    </pre>
-                  </details>
-                </div>
               </div>
             </article>
             );
           })}
         </section>
-      )}
+      ) : null}
 
-      {cameraStream ? (
+      {isCameraOpen ? (
         <section className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="camera-dialog-title">
           <div className="camera-dialog">
             <div className="pdf-dialog-header">
@@ -2856,13 +3166,13 @@ function App() {
               </div>
             </div>
             <div className="camera-preview">
-              <video ref={videoRef} playsInline muted />
+              {cameraStream ? <video ref={videoRef} playsInline muted /> : <div className="camera-placeholder">{cameraError || t('cameraUnavailable')}</div>}
             </div>
             <div className="pdf-dialog-footer">
               <button className="button" type="button" onClick={closeCameraCapture}>
                 {t('closeCamera')}
               </button>
-              <button className="button primary" type="button" onClick={captureCameraPhoto}>
+              <button className="button primary" type="button" onClick={captureCameraPhoto} disabled={!cameraStream}>
                 <Camera size={16} />
                 {t('capturePhoto')}
               </button>
@@ -2906,16 +3216,16 @@ function App() {
                 <button
                   className={`pdf-page-card ${page.selected ? 'selected' : ''}`}
                   type="button"
-                  key={page.pageNumber}
-                  onClick={() => togglePdfPage(page.pageNumber)}
+                  key={page.id}
+                  onClick={() => togglePdfPage(page.id)}
                 >
                   <span className="pdf-page-check">{page.selected ? <Check size={16} /> : null}</span>
-                  <img src={page.thumbnailUrl} alt={`${pdfDialog.fileName} page ${page.pageNumber}`} />
+                  <img src={page.thumbnailUrl} alt={`${page.fileName} page ${page.pageNumber}`} />
                   <strong>
                     {t('page')} {page.pageNumber}
                   </strong>
                   <small>
-                    {page.width} x {page.height}
+                    {page.fileName} · {page.width} x {page.height}
                   </small>
                 </button>
               ))}

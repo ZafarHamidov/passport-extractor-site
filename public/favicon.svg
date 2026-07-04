@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12" fill="#1d6d5c"/>
+  <path d="M32 10 48 16v13c0 11.5-6.7 19.8-16 25-9.3-5.2-16-13.5-16-25V16l16-6Z" fill="#ffffff" opacity=".2"/>
+  <path d="M23 32.5 29 38l13-15" fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="32" y="57" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="800" fill="#ffffff">PX</text>
+</svg>
