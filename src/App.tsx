@@ -7,7 +7,6 @@ import {
   Clipboard,
   Download,
   FileText,
-  FileJson,
   ImagePlus,
   Layers,
   Languages,
@@ -41,12 +40,14 @@ type ExtractedFields = {
   lastName: string;
   firstNames: string;
   birthDate: string;
+  placeOfBirth: string;
+  dateOfIssue: string;
   sex: string;
   expirationDate: string;
   personalNumber: string;
 };
 
-type NormalizedFields = Pick<ExtractedFields, 'birthDate' | 'expirationDate'>;
+type NormalizedFields = Pick<ExtractedFields, 'birthDate' | 'dateOfIssue' | 'expirationDate'>;
 
 type ExtractionAttempt = {
   rotation: number;
@@ -137,13 +138,22 @@ type ParsedCandidate = {
   candidateCount: number;
 };
 
+type VisibleFieldKey = 'placeOfBirth' | 'dateOfIssue' | 'nationality';
+
+type PassportProfile = {
+  id: string;
+  name: string;
+  countryCodes: string[];
+  labels: Record<VisibleFieldKey, RegExp[]>;
+};
+
 const translations = {
   en: {
     appTitle: "Zafar's Passport Extractor",
     subtitle: 'Device-only passport OCR',
     upload: 'Upload',
     camera: 'Camera',
-    json: 'JSON',
+    txt: 'TXT',
     csv: 'CSV',
     clearAll: 'Clear all',
     dropTitle: 'Drop passport images or PDFs here',
@@ -188,6 +198,8 @@ const translations = {
     issuingState: 'Issuing country',
     nationality: 'Nationality',
     birthDate: 'Birth date',
+    placeOfBirth: 'Place of birth',
+    dateOfIssue: 'Date of issue',
     sex: 'Sex',
     expirationDate: 'Expiry date',
     documentCode: 'Document code',
@@ -247,20 +259,26 @@ const translations = {
     aiRotationMismatch: 'Best OCR result used a different rotation.',
     aiLowOcrConfidence: 'OCR confidence is low.',
     aiUseMrzSuggestion: 'MRZ parse suggests this value.',
+    aiSurnameMayContainGivenNames: 'Surname may include given names. Check the MRZ name separator.',
     aiSuggestionArrow: 'to',
-    fastMode: 'Fast',
-    deepScanMode: 'Deep scan',
+    scanModeFast: 'Scan: Fast',
+    scanModeDeep: 'Scan: Deep',
     fastModeHint: 'Faster processing: MRZ first, visual text on demand.',
     deepScanHint: 'Slower processing: more MRZ attempts for difficult images.',
     visualOcrButton: 'Visual OCR',
     visualOcrRunning: 'Reading...',
+    languageCurrentEnglish: 'Language: English',
+    languageCurrentRussian: 'Language: Russian',
+    capturePhoto: 'Capture photo',
+    closeCamera: 'Close camera',
+    cameraUnavailable: 'Camera is unavailable. Falling back to file upload.',
   },
   ru: {
     appTitle: 'Паспортный экстрактор Zafar',
     subtitle: 'OCR паспорта только на устройстве',
     upload: 'Загрузить',
     camera: 'Камера',
-    json: 'JSON',
+    txt: 'TXT',
     csv: 'CSV',
     clearAll: 'Очистить',
     dropTitle: 'Перетащите фото паспорта или PDF сюда',
@@ -305,6 +323,8 @@ const translations = {
     issuingState: 'Страна выдачи',
     nationality: 'Гражданство',
     birthDate: 'Дата рождения',
+    placeOfBirth: 'Место рождения',
+    dateOfIssue: 'Дата выдачи',
     sex: 'Пол',
     expirationDate: 'Срок действия',
     documentCode: 'Код документа',
@@ -363,13 +383,19 @@ const translations = {
     aiRotationMismatch: 'Лучший OCR результат использовал другой поворот.',
     aiLowOcrConfidence: 'Уверенность OCR низкая.',
     aiUseMrzSuggestion: 'MRZ предлагает это значение.',
+    aiSurnameMayContainGivenNames: 'Фамилия может включать имена. Проверьте разделитель MRZ.',
     aiSuggestionArrow: 'на',
-    fastMode: 'Быстро',
-    deepScanMode: 'Глубокий поиск',
+    scanModeFast: 'Скан: быстро',
+    scanModeDeep: 'Скан: глубоко',
     fastModeHint: 'Быстрая обработка: сначала MRZ, видимый текст по запросу.',
     deepScanHint: 'Медленнее: больше попыток MRZ для сложных изображений.',
     visualOcrButton: 'Видимый OCR',
     visualOcrRunning: 'Чтение...',
+    languageCurrentEnglish: 'Язык: английский',
+    languageCurrentRussian: 'Язык: русский',
+    capturePhoto: 'Сделать фото',
+    closeCamera: 'Закрыть камеру',
+    cameraUnavailable: 'Камера недоступна. Открываем загрузку файла.',
     extractionAttemptPrefix: 'Лучшая попытка',
   },
 } satisfies Record<AppLanguage, Record<string, string>>;
@@ -381,10 +407,88 @@ const fieldLabels: Array<{ key: FieldKey; labelKey: string; prominent?: boolean 
   { key: 'issuingState', labelKey: 'issuingState' },
   { key: 'nationality', labelKey: 'nationality' },
   { key: 'birthDate', labelKey: 'birthDate' },
+  { key: 'placeOfBirth', labelKey: 'placeOfBirth' },
+  { key: 'dateOfIssue', labelKey: 'dateOfIssue' },
   { key: 'sex', labelKey: 'sex' },
   { key: 'expirationDate', labelKey: 'expirationDate' },
   { key: 'documentCode', labelKey: 'documentCode' },
   { key: 'personalNumber', labelKey: 'personalNumber' },
+];
+
+const commonVisibleLabels: Record<VisibleFieldKey, RegExp[]> = {
+  placeOfBirth: [
+    /(?:place\s+of\s+birth|birth\s+place|место\s+рождения|lieu\s+de\s+naissance)\s*[:\-]?\s*(.+)$/i,
+  ],
+  dateOfIssue: [
+    /(?:date\s+of\s+issue|issue\s+date|issued\s+on|дата\s+выдачи|date\s+de\s+d[eé]livrance)\s*[:\-]?\s*(.+)$/i,
+  ],
+  nationality: [/(?:nationality|гражданство|nationalit[eé])\s*[:\-]?\s*(.+)$/i],
+};
+
+const passportProfiles: PassportProfile[] = [
+  {
+    id: 'RUS',
+    name: 'Russian passport',
+    countryCodes: ['RUS'],
+    labels: {
+      placeOfBirth: [
+        ...commonVisibleLabels.placeOfBirth,
+        /(?:место\s+рожд\.?|место\s+рождения|place\s+of\s+birth)\s*[:\-]?\s*(.+)$/i,
+      ],
+      dateOfIssue: [
+        ...commonVisibleLabels.dateOfIssue,
+        /(?:дата\s+выдачи|выдан(?:о|а)?|date\s+of\s+issue)\s*[:\-]?\s*(.+)$/i,
+      ],
+      nationality: [
+        ...commonVisibleLabels.nationality,
+        /(?:гражданство|citizenship|nationality)\s*[:\-]?\s*(.+)$/i,
+      ],
+    },
+  },
+  {
+    id: 'TJK',
+    name: 'Tajik passport',
+    countryCodes: ['TJK'],
+    labels: {
+      placeOfBirth: [
+        ...commonVisibleLabels.placeOfBirth,
+        /(?:ҷои\s+таваллуд|чои\s+таваллуд|место\s+рождения|place\s+of\s+birth)\s*[:\-]?\s*(.+)$/i,
+      ],
+      dateOfIssue: [
+        ...commonVisibleLabels.dateOfIssue,
+        /(?:санаи\s+(?:дода\s+шудан|супоридан)|дата\s+выдачи|date\s+of\s+issue)\s*[:\-]?\s*(.+)$/i,
+      ],
+      nationality: [
+        ...commonVisibleLabels.nationality,
+        /(?:шаҳрвандӣ|шахрванди|гражданство|nationality)\s*[:\-]?\s*(.+)$/i,
+      ],
+    },
+  },
+  {
+    id: 'UZB',
+    name: 'Uzbek passport',
+    countryCodes: ['UZB'],
+    labels: {
+      placeOfBirth: [
+        ...commonVisibleLabels.placeOfBirth,
+        /(?:tug(?:‘|'|`)?ilgan\s+joyi|туғилган\s+жойи|место\s+рождения|place\s+of\s+birth)\s*[:\-]?\s*(.+)$/i,
+      ],
+      dateOfIssue: [
+        ...commonVisibleLabels.dateOfIssue,
+        /(?:berilgan\s+sana|берилган\s+сана|дата\s+выдачи|date\s+of\s+issue)\s*[:\-]?\s*(.+)$/i,
+      ],
+      nationality: [
+        ...commonVisibleLabels.nationality,
+        /(?:fuqaroligi|фуқаролиги|гражданство|nationality)\s*[:\-]?\s*(.+)$/i,
+      ],
+    },
+  },
+  {
+    id: 'GENERIC',
+    name: 'Generic TD3 passport',
+    countryCodes: [],
+    labels: commonVisibleLabels,
+  },
 ];
 
 const emptyFields: ExtractedFields = {
@@ -395,6 +499,8 @@ const emptyFields: ExtractedFields = {
   lastName: '',
   firstNames: '',
   birthDate: '',
+  placeOfBirth: '',
+  dateOfIssue: '',
   sex: '',
   expirationDate: '',
   personalNumber: '',
@@ -402,6 +508,7 @@ const emptyFields: ExtractedFields = {
 
 const emptyNormalizedFields: NormalizedFields = {
   birthDate: '',
+  dateOfIssue: '',
   expirationDate: '',
 };
 
@@ -592,8 +699,41 @@ function normalizeMrzDate(value: string, kind: 'birth' | 'expiry') {
   return formatDate(chosen.year, parts.month, parts.day);
 }
 
+function normalizeOcrDigits(value: string) {
+  return value
+    .replace(/[Oo]/g, '0')
+    .replace(/[Il|]/g, '1')
+    .replace(/[Ss]/g, '5')
+    .replace(/[Bb]/g, '8');
+}
+
+function normalizeVisibleDate(value: string) {
+  const normalized = normalizeOcrDigits(value).trim();
+  const numericMatch = normalized.match(/\b(\d{1,2})[.\-/\s](\d{1,2})[.\-/\s](\d{2,4})\b/);
+  const isoMatch = normalized.match(/\b(\d{4})[.\-/\s](\d{1,2})[.\-/\s](\d{1,2})\b/);
+
+  if (isoMatch) {
+    const [, yearText, monthText, dayText] = isoMatch;
+    const year = Number(yearText);
+    const month = Number(monthText);
+    const day = Number(dayText);
+    return isValidDate(year, month, day) ? formatDate(year, month, day) : value;
+  }
+
+  if (!numericMatch) {
+    return value;
+  }
+
+  const [, dayText, monthText, yearText] = numericMatch;
+  const day = Number(dayText);
+  const month = Number(monthText);
+  const year = Number(yearText.length === 2 ? `20${yearText}` : yearText);
+
+  return isValidDate(year, month, day) ? formatDate(year, month, day) : value;
+}
+
 function getDisplayField(record: PassportRecord, key: FieldKey) {
-  if (key === 'birthDate' || key === 'expirationDate') {
+  if (key === 'birthDate' || key === 'dateOfIssue' || key === 'expirationDate') {
     return record.normalizedFields[key] || record.fields[key];
   }
 
@@ -693,10 +833,76 @@ function normalizeSecondMrzLineFillers(line: string) {
   return `${documentNumber}${middle}${personalNumber}${checks}`.slice(0, 44);
 }
 
+function uniqueStrings(values: string[]) {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    if (seen.has(value)) {
+      return false;
+    }
+    seen.add(value);
+    return true;
+  });
+}
+
+function buildFirstLineVariants(line: string) {
+  const padded = toMrzLength(line);
+  const chars = padded.split('');
+  const variants = [padded, normalizeFirstMrzLineFillers(padded)];
+
+  if (chars[0] === 'P' && /[KCL]/.test(chars[1])) {
+    variants.push(`P<${padded.slice(2)}`);
+  }
+
+  const prefix = variants[variants.length - 1].slice(0, 5);
+  const names = padded.slice(5);
+  const trailingFixedNames = replaceTrailingLikelyFillers(names, 3);
+  variants.push(`${prefix}${trailingFixedNames}`.slice(0, 44));
+
+  const fillerPairPattern = /[KCL<]{2}/g;
+  let match: RegExpExecArray | null;
+  while ((match = fillerPairPattern.exec(names))) {
+    const index = match.index;
+    const before = names.slice(0, index);
+    const after = names.slice(index + 2);
+
+    if (before.replace(/<+$/, '').length < 3 || !/[A-Z]/.test(after)) {
+      continue;
+    }
+
+    const normalizedAfter = replaceTrailingLikelyFillers(after, 3);
+    variants.push(`${prefix}${before}<<${normalizedAfter}`.slice(0, 44).padEnd(44, '<'));
+  }
+
+  return uniqueStrings(variants.map((variant) => toMrzLength(variant)));
+}
+
+function buildSecondLineVariants(line: string) {
+  const padded = toMrzLength(line);
+  const documentNumber = padded.slice(0, 9);
+  const middle = padded.slice(9, 28);
+  const personalNumber = padded.slice(28, 42);
+  const checks = padded.slice(42, 44);
+  const documentVariants = uniqueStrings([documentNumber, replaceTrailingLikelyFillers(documentNumber, 2)]);
+  const personalVariants = uniqueStrings([
+    personalNumber,
+    replaceTrailingLikelyFillers(personalNumber, 2),
+    replaceLikelyFillerRuns(personalNumber, 2),
+  ]);
+  const variants: string[] = [];
+
+  for (const documentVariant of documentVariants) {
+    for (const personalVariant of personalVariants) {
+      variants.push(`${documentVariant}${middle}${personalVariant}${checks}`.slice(0, 44));
+    }
+  }
+
+  return uniqueStrings(variants.map((variant) => toMrzLength(variant)));
+}
+
 function expandCandidatePair(pair: string[]) {
   const [firstLine, secondLine] = pair;
-  const firstVariants = [firstLine, normalizeFirstMrzLineFillers(firstLine)];
-  const secondVariants = [secondLine, normalizeSecondMrzLineFillers(secondLine)];
+  const firstVariants = buildFirstLineVariants(firstLine);
+  const secondVariants = buildSecondLineVariants(secondLine);
   const variants: string[][] = [];
 
   for (const firstVariant of firstVariants) {
@@ -774,6 +980,21 @@ function scoreMrzLineQuality(lines: string[]) {
     score += 4;
   }
 
+  const namesField = firstLine.slice(5).replace(/<+$/, '');
+  const separatorIndex = namesField.indexOf('<<');
+  if (separatorIndex >= 3) {
+    score += Math.min(14, separatorIndex);
+  } else if (separatorIndex >= 0) {
+    score -= 10;
+  } else {
+    score -= 14;
+  }
+
+  const givenNames = separatorIndex >= 0 ? namesField.slice(separatorIndex + 2).replace(/</g, ' ').trim() : '';
+  if (givenNames.length >= 2) {
+    score += 4;
+  }
+
   const firstTrailingFillers = firstLine.match(/<+$/)?.[0].length ?? 0;
   score += Math.min(8, firstTrailingFillers);
 
@@ -826,6 +1047,8 @@ function extractedFieldsFromParse(result: ParseResult): ExtractedFields {
     lastName: fields.lastName ?? '',
     firstNames: fields.firstName ?? '',
     birthDate: fields.birthDate ?? '',
+    placeOfBirth: '',
+    dateOfIssue: '',
     sex: fields.sex ?? '',
     expirationDate: fields.expirationDate ?? '',
     personalNumber: fields.personalNumber ?? '',
@@ -835,7 +1058,95 @@ function extractedFieldsFromParse(result: ParseResult): ExtractedFields {
 function normalizedFieldsFromExtracted(fields: ExtractedFields): NormalizedFields {
   return {
     birthDate: normalizeMrzDate(fields.birthDate, 'birth'),
+    dateOfIssue: normalizeVisibleDate(fields.dateOfIssue),
     expirationDate: normalizeMrzDate(fields.expirationDate, 'expiry'),
+  };
+}
+
+function cleanVisibleFieldValue(value: string) {
+  return value
+    .replace(/\s{2,}/g, ' ')
+    .replace(/[|]/g, 'I')
+    .replace(/^[\s:;.,-]+|[\s:;.,-]+$/g, '')
+    .trim();
+}
+
+function getPassportProfileFromCodes(...codes: Array<string | undefined>) {
+  const normalizedCodes = codes
+    .filter(Boolean)
+    .map((code) => String(code).toUpperCase().replace(/[^A-Z]/g, ''))
+    .filter(Boolean);
+
+  return (
+    passportProfiles.find((profile) =>
+      profile.countryCodes.some((countryCode) => normalizedCodes.includes(countryCode)),
+    ) ?? passportProfiles[passportProfiles.length - 1]
+  );
+}
+
+function getPassportProfile(record: PassportRecord) {
+  return getPassportProfileFromCodes(record.fields.issuingState, record.fields.nationality);
+}
+
+function getPassportProfileFromText(text: string) {
+  const upperText = text.toUpperCase();
+  return (
+    passportProfiles.find((profile) =>
+      profile.countryCodes.some(
+        (countryCode) =>
+          upperText.includes(countryCode) ||
+          (countryCode === 'RUS' && /РОССИЙСКАЯ|РОССИЯ|RUSSIAN/.test(upperText)) ||
+          (countryCode === 'TJK' && /ТОҶИКИСТОН|ТОЧИКИСТОН|TAJIK/.test(upperText)) ||
+          (countryCode === 'UZB' && /O['‘`]?ZBEKISTON|УЗБЕКИСТАН|UZBEK/.test(upperText)),
+      ),
+    ) ?? passportProfiles[passportProfiles.length - 1]
+  );
+}
+
+function getVisibleLabelValue(lines: string[], labels: RegExp[]) {
+  for (const line of lines) {
+    const normalizedLine = line.replace(/\s{2,}/g, ' ').trim();
+    for (const label of labels) {
+      const match = normalizedLine.match(label);
+      if (match?.[1]) {
+        return cleanVisibleFieldValue(match[1]);
+      }
+    }
+  }
+
+  return '';
+}
+
+function extractVisibleFields(text: string, profile = getPassportProfileFromText(text)): Partial<ExtractedFields> {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const placeOfBirth = getVisibleLabelValue(lines, profile.labels.placeOfBirth);
+  const dateOfIssue = getVisibleLabelValue(lines, profile.labels.dateOfIssue);
+  const nationality = getVisibleLabelValue(lines, profile.labels.nationality);
+
+  return {
+    ...(placeOfBirth ? { placeOfBirth: placeOfBirth.toUpperCase() } : {}),
+    ...(dateOfIssue ? { dateOfIssue: normalizeVisibleDate(dateOfIssue) } : {}),
+    ...(nationality ? { nationality: nationality.toUpperCase() } : {}),
+  };
+}
+
+function mergeVisibleFields(record: PassportRecord, visibleFields: Partial<ExtractedFields>) {
+  const nextFields = { ...record.fields };
+
+  for (const key of ['placeOfBirth', 'dateOfIssue', 'nationality'] as FieldKey[]) {
+    const value = visibleFields[key];
+    if (value && !getDisplayField(record, key)) {
+      nextFields[key] = value;
+    }
+  }
+
+  return {
+    fields: nextFields,
+    normalizedFields: normalizedFieldsFromExtracted(nextFields),
   };
 }
 
@@ -931,6 +1242,8 @@ function buildAiReview(record: PassportRecord): AiReview {
   const missingFields = requiredTravelFields.filter((key) => !getAiFieldValue(record, key));
   const invalidDetails = record.validationDetails.filter((detail) => !detail.valid);
   const passportNumber = getAiFieldValue(record, 'passportNumber');
+  const surnameWords = getAiFieldValue(record, 'lastName').split(/\s+/).filter(Boolean);
+  const givenNameWords = getAiFieldValue(record, 'firstNames').split(/\s+/).filter(Boolean);
   const birthDate = getAiFieldValue(record, 'birthDate');
   const expirationDate = getAiFieldValue(record, 'expirationDate');
   const parsedBirthDate = birthDate ? parseTravelDate(birthDate) : null;
@@ -949,6 +1262,14 @@ function buildAiReview(record: PassportRecord): AiReview {
       severity: 'critical',
       messageKey: 'aiMissingRequiredFields',
       detail: missingFields.map((key) => fieldLabelKeysByField[key]).join(', '),
+    });
+  }
+
+  if (surnameWords.length > 2 || (surnameWords.length > 1 && !givenNameWords.length)) {
+    issues.push({
+      id: 'surname-may-contain-given-names',
+      severity: 'warning',
+      messageKey: 'aiSurnameMayContainGivenNames',
     });
   }
 
@@ -1261,10 +1582,12 @@ async function renderPdfPagesToFiles(file: File, pageNumbers: number[]): Promise
 
 function recordToExport(record: PassportRecord) {
   const aiReview = buildAiReview(record);
+  const passportProfile = getPassportProfile(record);
 
   return {
     id: record.id,
     sourceFileName: record.sourceFileName,
+    passportProfile: passportProfile.name,
     status: record.status,
     fields: record.fields,
     normalizedFields: record.normalizedFields,
@@ -1298,6 +1621,8 @@ function buildCsv(records: PassportRecord[]) {
     'firstNames',
     'birthDate',
     'birthDateFormatted',
+    'placeOfBirth',
+    'dateOfIssue',
     'sex',
     'expirationDate',
     'expirationDateFormatted',
@@ -1324,6 +1649,8 @@ function buildCsv(records: PassportRecord[]) {
       record.fields.firstNames,
       record.fields.birthDate,
       record.normalizedFields.birthDate,
+      record.fields.placeOfBirth,
+      record.normalizedFields.dateOfIssue,
       record.fields.sex,
       record.fields.expirationDate,
       record.normalizedFields.expirationDate,
@@ -1340,6 +1667,41 @@ function buildCsv(records: PassportRecord[]) {
   });
 
   return [headers, ...rows].map((row) => row.map(escapeCsv).join(',')).join('\n');
+}
+
+function buildTxt(records: PassportRecord[], t: (key: string) => string) {
+  return records
+    .map((record, index) => {
+      const aiReview = buildAiReview(record);
+      const passportProfile = getPassportProfile(record);
+      const lines = [
+        `#${index + 1} ${record.sourceFileName}`,
+        `Profile: ${passportProfile.name}`,
+        `Status: ${record.status}`,
+        `${t('passportNumber')}: ${record.fields.passportNumber}`,
+        `${t('documentCode')}: ${record.fields.documentCode}`,
+        `${t('issuingState')}: ${record.fields.issuingState}`,
+        `${t('nationality')}: ${record.fields.nationality}`,
+        `${t('lastName')}: ${record.fields.lastName}`,
+        `${t('firstNames')}: ${record.fields.firstNames}`,
+        `${t('birthDate')}: ${record.normalizedFields.birthDate || record.fields.birthDate}`,
+        `${t('placeOfBirth')}: ${record.fields.placeOfBirth}`,
+        `${t('dateOfIssue')}: ${record.normalizedFields.dateOfIssue || record.fields.dateOfIssue}`,
+        `${t('sex')}: ${record.fields.sex}`,
+        `${t('expirationDate')}: ${record.normalizedFields.expirationDate || record.fields.expirationDate}`,
+        `${t('personalNumber')}: ${record.fields.personalNumber}`,
+        `${t('aiConfidence')}: ${aiReview.confidence}%`,
+        `${t('rawMrz')}:`,
+        record.rawMrz || '',
+      ];
+
+      if (record.visualOcrText) {
+        lines.push('', `${t('visualText')}:`, record.visualOcrText);
+      }
+
+      return lines.join('\n');
+    })
+    .join('\n\n---\n\n');
 }
 
 async function copyText(text: string) {
@@ -1377,8 +1739,11 @@ function App() {
   const [pdfImportMessage, setPdfImportMessage] = useState('');
   const [isImportingPdf, setIsImportingPdf] = useState(false);
   const [visualOcrRecordIds, setVisualOcrRecordIds] = useState<Set<string>>(() => new Set());
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [cameraError, setCameraError] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const workerRef = useRef<Tesseract.Worker | null>(null);
   const visualWorkerRef = useRef<Tesseract.Worker | null>(null);
   const activeRecordIdRef = useRef<string | null>(null);
@@ -1436,6 +1801,17 @@ function App() {
   useEffect(() => {
     pdfDialogRef.current = pdfDialog;
   }, [pdfDialog]);
+
+  useEffect(() => {
+    if (videoRef.current && cameraStream) {
+      videoRef.current.srcObject = cameraStream;
+      void videoRef.current.play();
+    }
+
+    return () => {
+      cameraStream?.getTracks().forEach((track) => track.stop());
+    };
+  }, [cameraStream]);
 
   useEffect(() => {
     return () => {
@@ -1633,11 +2009,13 @@ function App() {
       const parsed = extraction.parsed;
 
       if (!parsed) {
+        const embeddedVisibleFields = record.embeddedText ? extractVisibleFields(record.embeddedText) : {};
         setRecord(record.id, (current) => ({
           ...current,
           status: 'needs-review',
           progress: 100,
           message: 'Manual review',
+          ...mergeVisibleFields(current, embeddedVisibleFields),
           ocrText: extraction.ocrText,
           extractionAttempt: extraction.attempt,
           valid: false,
@@ -1648,13 +2026,23 @@ function App() {
 
       const validationDetails = parsed.result.details;
       const fields = extractedFieldsFromParse(parsed.result);
+      const profile = getPassportProfileFromCodes(fields.issuingState, fields.nationality);
+      const visibleFields = record.embeddedText ? extractVisibleFields(record.embeddedText, profile) : {};
+      const visibleMerge = mergeVisibleFields(
+        {
+          ...record,
+          fields,
+          normalizedFields: normalizedFieldsFromExtracted(fields),
+        },
+        visibleFields,
+      );
       setRecord(record.id, (current) => ({
         ...current,
         status: parsed.result.valid ? 'done' : 'needs-review',
         progress: 100,
         message: parsed.result.valid ? 'Extracted' : 'Check fields',
-        fields,
-        normalizedFields: normalizedFieldsFromExtracted(fields),
+        fields: visibleMerge.fields,
+        normalizedFields: visibleMerge.normalizedFields,
         rawMrz: parsed.lines.join('\n'),
         valid: parsed.result.valid,
         validationDetails,
@@ -1687,6 +2075,7 @@ function App() {
       setRecord(record.id, (current) => ({
         ...current,
         visualOcrText,
+        ...mergeVisibleFields(current, extractVisibleFields(visualOcrText, getPassportProfile(current))),
       }));
     } catch {
       setCopiedLabel(t('ocrFailed'));
@@ -1855,6 +2244,63 @@ function App() {
     }
   }
 
+  async function openCameraCapture() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCopiedLabel(t('cameraUnavailable'));
+      window.setTimeout(() => setCopiedLabel(''), 1800);
+      cameraInputRef.current?.click();
+      return;
+    }
+
+    setCameraError('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1600 },
+          height: { ideal: 1000 },
+        },
+      });
+      setCameraStream(stream);
+    } catch {
+      setCameraError(t('cameraUnavailable'));
+      setCopiedLabel(t('cameraUnavailable'));
+      window.setTimeout(() => setCopiedLabel(''), 1800);
+      cameraInputRef.current?.click();
+    }
+  }
+
+  function closeCameraCapture() {
+    cameraStream?.getTracks().forEach((track) => track.stop());
+    setCameraStream(null);
+    setCameraError('');
+  }
+
+  async function captureCameraPhoto() {
+    const video = videoRef.current;
+    if (!video || !video.videoWidth || !video.videoHeight) {
+      return;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext('2d');
+    if (!context) {
+      setCameraError(t('canvasUnavailable'));
+      return;
+    }
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const blob = await canvasToBlob(canvas);
+    const file = new File([blob], `camera-passport-${Date.now()}.png`, { type: 'image/png' });
+    const record = createRecord(file);
+    setRecords((current) => [record, ...current]);
+    queueRecords([record]);
+    closeCameraCapture();
+  }
+
   function retryRecord(record: PassportRecord) {
     const retryVersion: PassportRecord = {
       ...record,
@@ -1890,11 +2336,11 @@ function App() {
       ...record,
       fields: {
         ...record.fields,
-        ...(key === 'birthDate' || key === 'expirationDate' ? {} : { [key]: value }),
+        ...(key === 'birthDate' || key === 'dateOfIssue' || key === 'expirationDate' ? {} : { [key]: value }),
       },
       normalizedFields: {
         ...record.normalizedFields,
-        ...(key === 'birthDate' || key === 'expirationDate' ? { [key]: value } : {}),
+        ...(key === 'birthDate' || key === 'dateOfIssue' || key === 'expirationDate' ? { [key]: value } : {}),
       },
     }));
   }
@@ -1915,13 +2361,13 @@ function App() {
           ...updatedRecord,
           fields: {
             ...updatedRecord.fields,
-            ...(suggestion.field === 'birthDate' || suggestion.field === 'expirationDate'
+            ...(suggestion.field === 'birthDate' || suggestion.field === 'dateOfIssue' || suggestion.field === 'expirationDate'
               ? {}
               : { [suggestion.field]: suggestion.suggestedValue }),
           },
           normalizedFields: {
             ...updatedRecord.normalizedFields,
-            ...(suggestion.field === 'birthDate' || suggestion.field === 'expirationDate'
+            ...(suggestion.field === 'birthDate' || suggestion.field === 'dateOfIssue' || suggestion.field === 'expirationDate'
               ? { [suggestion.field]: suggestion.suggestedValue }
               : {}),
           },
@@ -1980,11 +2426,11 @@ function App() {
     }
   }
 
-  function exportJson() {
-    const blob = new Blob([JSON.stringify(records.map(recordToExport), null, 2)], {
-      type: 'application/json;charset=utf-8',
+  function exportTxt() {
+    const blob = new Blob([buildTxt(records, t)], {
+      type: 'text/plain;charset=utf-8',
     });
-    downloadBlob('passports.json', blob);
+    downloadBlob('passports.txt', blob);
   }
 
   function exportCsv() {
@@ -2000,10 +2446,10 @@ function App() {
         <div className="brand">
           <div className="brand-mark">
             <ShieldCheck size={24} />
+            <span>PX</span>
           </div>
           <div>
             <h1>{t('appTitle')}</h1>
-            <p>{t('subtitle')}</p>
           </div>
         </div>
 
@@ -2038,7 +2484,7 @@ function App() {
             <Upload size={17} />
             {t('upload')}
           </button>
-          <button className="button" type="button" onClick={() => cameraInputRef.current?.click()}>
+          <button className="button" type="button" onClick={openCameraCapture}>
             <Camera size={17} />
             {t('camera')}
           </button>
@@ -2049,11 +2495,11 @@ function App() {
             title={isDeepScan ? t('deepScanHint') : t('fastModeHint')}
           >
             <Sparkles size={17} />
-            {isDeepScan ? t('deepScanMode') : t('fastMode')}
+            {isDeepScan ? t('scanModeDeep') : t('scanModeFast')}
           </button>
-          <button className="button" type="button" onClick={exportJson} disabled={!records.length}>
-            <FileJson size={17} />
-            {t('json')}
+          <button className="button" type="button" onClick={exportTxt} disabled={!records.length}>
+            <FileText size={17} />
+            {t('txt')}
           </button>
           <button className="button" type="button" onClick={exportCsv} disabled={!records.length}>
             <Download size={17} />
@@ -2061,7 +2507,7 @@ function App() {
           </button>
           <button className="button" type="button" onClick={toggleLanguage} title="Language">
             <Languages size={17} />
-            {t('languageToggle')}
+            {language === 'en' ? t('languageCurrentEnglish') : t('languageCurrentRussian')}
           </button>
           <button className="icon-button danger" type="button" onClick={clearAll} disabled={!records.length} title={t('clearAll')}>
             <Trash2 size={18} />
@@ -2097,19 +2543,16 @@ function App() {
           <span>
             {stats.review} {t('review')}
           </span>
-          <span>
-            {pdfImportMessage ||
-              (workerState === 'loading' ? t('ocrLoading') : workerState === 'ready' ? t('ocrReady') : t('ocrIdle'))}
-          </span>
+          {pdfImportMessage ? <span>{pdfImportMessage}</span> : null}
         </div>
       </section>
 
       {records.length === 0 ? (
-        <section className="empty-state">
+        <button className="empty-state empty-state-button" type="button" onClick={() => fileInputRef.current?.click()}>
           <Clipboard size={30} />
           <h2>{t('noPassports')}</h2>
           <p>{t('emptyHint')}</p>
-        </section>
+        </button>
       ) : (
         <section className="record-list" aria-label="Imported passports and extracted data">
           {records.map((record) => {
@@ -2398,6 +2841,35 @@ function App() {
           })}
         </section>
       )}
+
+      {cameraStream ? (
+        <section className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="camera-dialog-title">
+          <div className="camera-dialog">
+            <div className="pdf-dialog-header">
+              <div>
+                <div className="eyebrow">
+                  <Camera size={15} />
+                  {t('camera')}
+                </div>
+                <h2 id="camera-dialog-title">{t('capturePhoto')}</h2>
+                {cameraError ? <p>{cameraError}</p> : null}
+              </div>
+            </div>
+            <div className="camera-preview">
+              <video ref={videoRef} playsInline muted />
+            </div>
+            <div className="pdf-dialog-footer">
+              <button className="button" type="button" onClick={closeCameraCapture}>
+                {t('closeCamera')}
+              </button>
+              <button className="button primary" type="button" onClick={captureCameraPhoto}>
+                <Camera size={16} />
+                {t('capturePhoto')}
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       {pdfDialog ? (
         <section className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="pdf-dialog-title">

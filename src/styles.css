@@ -60,6 +60,7 @@ button {
 }
 
 .brand-mark {
+  position: relative;
   display: grid;
   place-items: center;
   width: 46px;
@@ -69,6 +70,18 @@ button {
   background: #1d6d5c;
   border-radius: 8px;
   box-shadow: 0 12px 28px rgb(29 109 92 / 18%);
+}
+
+.brand-mark svg {
+  position: absolute;
+  opacity: 0.32;
+}
+
+.brand-mark span {
+  position: relative;
+  font-size: 0.86rem;
+  font-weight: 860;
+  letter-spacing: 0;
 }
 
 .brand h1 {
@@ -226,6 +239,7 @@ button {
 .empty-state {
   display: grid;
   place-items: center;
+  width: 100%;
   max-width: 100%;
   min-height: 320px;
   margin-top: 18px;
@@ -234,6 +248,21 @@ button {
   border-radius: 8px;
   background: #ffffff;
   text-align: center;
+}
+
+.empty-state-button {
+  color: inherit;
+  cursor: pointer;
+}
+
+.empty-state-button:hover {
+  border-color: #9aa9bd;
+  background: #f8fbff;
+}
+
+.empty-state-button:focus-visible {
+  outline: 3px solid rgb(36 88 211 / 25%);
+  outline-offset: 3px;
 }
 
 .empty-state svg {
@@ -846,6 +875,32 @@ pre {
   border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 28px 80px rgb(15 23 42 / 32%);
+}
+
+.camera-dialog {
+  display: grid;
+  gap: 14px;
+  width: min(820px, 100%);
+  max-height: min(760px, calc(100vh - 36px));
+  overflow: auto;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 28px 80px rgb(15 23 42 / 32%);
+}
+
+.camera-preview {
+  margin-inline: 16px;
+  overflow: hidden;
+  border: 1px solid #d6dde8;
+  border-radius: 8px;
+  background: #0f172a;
+}
+
+.camera-preview video {
+  display: block;
+  width: 100%;
+  max-height: min(560px, calc(100vh - 230px));
+  object-fit: contain;
 }
 
 .pdf-dialog-header,
