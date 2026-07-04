@@ -248,6 +248,12 @@ const translations = {
     aiLowOcrConfidence: 'OCR confidence is low.',
     aiUseMrzSuggestion: 'MRZ parse suggests this value.',
     aiSuggestionArrow: 'to',
+    fastMode: 'Fast',
+    deepScanMode: 'Deep scan',
+    fastModeHint: 'Faster processing: MRZ first, visual text on demand.',
+    deepScanHint: 'Slower processing: more MRZ attempts for difficult images.',
+    visualOcrButton: 'Visual OCR',
+    visualOcrRunning: 'Reading...',
   },
   ru: {
     appTitle: 'Паспортный экстрактор Zafar',
@@ -358,6 +364,12 @@ const translations = {
     aiLowOcrConfidence: 'Уверенность OCR низкая.',
     aiUseMrzSuggestion: 'MRZ предлагает это значение.',
     aiSuggestionArrow: 'на',
+    fastMode: 'Быстро',
+    deepScanMode: 'Глубокий поиск',
+    fastModeHint: 'Быстрая обработка: сначала MRZ, видимый текст по запросу.',
+    deepScanHint: 'Медленнее: больше попыток MRZ для сложных изображений.',
+    visualOcrButton: 'Видимый OCR',
+    visualOcrRunning: 'Чтение...',
     extractionAttemptPrefix: 'Лучшая попытка',
   },
 } satisfies Record<AppLanguage, Record<string, string>>;
@@ -483,6 +495,14 @@ function getSavedLanguage(): AppLanguage {
     return saved === 'ru' ? 'ru' : 'en';
   } catch {
     return 'en';
+  }
+}
+
+function getSavedDeepScan() {
+  try {
+    return window.localStorage.getItem('passport-extractor-deep-scan') === 'true';
+  } catch {
+    return false;
   }
 }
 
@@ -620,9 +640,80 @@ function cleanMrzLine(line: string) {
     .replace(/[^A-Z0-9<]/g, '');
 }
 
+function replaceLikelyFillerRuns(value: string, minLength = 2) {
+  return value.replace(new RegExp(`[KCL<]{${minLength},}`, 'g'), (match) => '<'.repeat(match.length));
+}
+
+function replaceTrailingLikelyFillers(value: string, minLength = 2) {
+  return value.replace(new RegExp(`[KCL<]{${minLength},}$`), (match) => '<'.repeat(match.length));
+}
+
+function replaceLikelyNameFillers(value: string) {
+  const normalized = replaceTrailingLikelyFillers(value, 3).replace(/<{2,}|KK|CC/g, (match) =>
+    '<'.repeat(match.length),
+  );
+
+  const bodyWithoutTrailingFillers = normalized.replace(/<+$/, '');
+
+  if (bodyWithoutTrailingFillers.includes('<<')) {
+    return normalized;
+  }
+
+  return normalized.replace(/([A-Z]{2,})(KK|CC|LL)([A-Z]{2,})/, (_, before: string, match: string, after: string) =>
+    `${before}${'<'.repeat(match.length)}${after}`,
+  );
+}
+
 function toMrzLength(line: string, length = 44) {
   const trimmed = line.slice(0, length);
   return trimmed.padEnd(length, '<');
+}
+
+function normalizeFirstMrzLineFillers(line: string) {
+  const chars = toMrzLength(line).split('');
+
+  if (chars[0] === 'P' && (chars[1] === 'K' || chars[1] === 'C' || chars[1] === 'L')) {
+    chars[1] = '<';
+  }
+
+  const prefix = chars.slice(0, 5).join('');
+  const names = chars.slice(5).join('');
+  const normalizedNames = replaceLikelyNameFillers(names);
+
+  return `${prefix}${normalizedNames}`.slice(0, 44);
+}
+
+function normalizeSecondMrzLineFillers(line: string) {
+  const padded = toMrzLength(line);
+  const documentNumber = replaceTrailingLikelyFillers(padded.slice(0, 9), 2);
+  const middle = padded.slice(9, 28);
+  const personalNumber = replaceTrailingLikelyFillers(replaceLikelyFillerRuns(padded.slice(28, 42)), 2);
+  const checks = padded.slice(42, 44);
+
+  return `${documentNumber}${middle}${personalNumber}${checks}`.slice(0, 44);
+}
+
+function expandCandidatePair(pair: string[]) {
+  const [firstLine, secondLine] = pair;
+  const firstVariants = [firstLine, normalizeFirstMrzLineFillers(firstLine)];
+  const secondVariants = [secondLine, normalizeSecondMrzLineFillers(secondLine)];
+  const variants: string[][] = [];
+
+  for (const firstVariant of firstVariants) {
+    for (const secondVariant of secondVariants) {
+      variants.push([firstVariant, secondVariant]);
+    }
+  }
+
+  const seen = new Set<string>();
+  return variants.filter((variant) => {
+    const key = variant.join('\n');
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 function findCandidatePairs(text: string) {
@@ -636,7 +727,7 @@ function findCandidatePairs(text: string) {
   for (let index = 0; index < lines.length - 1; index += 1) {
     const firstLine = lines[index];
     const secondLine = lines[index + 1];
-    const firstStart = Math.max(firstLine.indexOf('P<'), firstLine.search(/^P[A-Z0-9<]/));
+    const firstStart = Math.max(firstLine.search(/P[<KCL]/), firstLine.search(/^P[A-Z0-9<]/));
     const lineOne = firstStart >= 0 ? firstLine.slice(firstStart) : firstLine;
 
     if (lineOne.length >= 30 && secondLine.length >= 30) {
@@ -645,14 +736,14 @@ function findCandidatePairs(text: string) {
   }
 
   const compact = lines.join('');
-  const compactStart = compact.indexOf('P<');
+  const compactStart = compact.search(/P[<KCL]/);
   if (compactStart >= 0 && compact.length >= compactStart + 70) {
     const candidate = compact.slice(compactStart, compactStart + 88);
     pairs.push([toMrzLength(candidate.slice(0, 44)), toMrzLength(candidate.slice(44, 88))]);
   }
 
   const seen = new Set<string>();
-  return pairs.filter((pair) => {
+  return pairs.flatMap(expandCandidatePair).filter((pair) => {
     const key = pair.join('\n');
     if (seen.has(key)) {
       return false;
@@ -671,6 +762,40 @@ function scoreParseResult(result: ParseResult) {
   return validScore + passportFormatScore + documentNumberScore + validDetails - invalidDetails * 3;
 }
 
+function scoreMrzLineQuality(lines: string[]) {
+  const [firstLine, secondLine] = lines;
+  let score = 0;
+
+  if (firstLine[1] === '<') {
+    score += 3;
+  }
+
+  if (firstLine.slice(5).includes('<<')) {
+    score += 4;
+  }
+
+  const firstTrailingFillers = firstLine.match(/<+$/)?.[0].length ?? 0;
+  score += Math.min(8, firstTrailingFillers);
+
+  if (/[KCL]{3,}$/.test(firstLine)) {
+    score -= 6;
+  }
+
+  if (/[KCL<]{2,}$/.test(secondLine.slice(0, 9))) {
+    score += 2;
+  }
+
+  const personalNumber = secondLine.slice(28, 42);
+  const personalFillers = personalNumber.match(/<+$/)?.[0].length ?? 0;
+  score += Math.min(6, personalFillers);
+
+  if (/[KCL]{2,}/.test(personalNumber)) {
+    score -= 4;
+  }
+
+  return score;
+}
+
 function parseBestMrz(ocrText: string): ParsedCandidate | null {
   const candidates = findCandidatePairs(ocrText);
   let bestCandidate: ParsedCandidate | null = null;
@@ -678,7 +803,7 @@ function parseBestMrz(ocrText: string): ParsedCandidate | null {
   for (const lines of candidates) {
     try {
       const result = parse(lines, { autocorrect: true });
-      const score = scoreParseResult(result);
+      const score = scoreParseResult(result) + scoreMrzLineQuality(lines);
       if (!bestCandidate || score > bestCandidate.score) {
         bestCandidate = { result, lines, score, candidateCount: candidates.length };
       }
@@ -1243,6 +1368,7 @@ async function copyText(text: string) {
 
 function App() {
   const [language, setLanguage] = useState<AppLanguage>(getSavedLanguage);
+  const [isDeepScan, setIsDeepScan] = useState(getSavedDeepScan);
   const [records, setRecords] = useState<PassportRecord[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [copiedLabel, setCopiedLabel] = useState('');
@@ -1250,6 +1376,7 @@ function App() {
   const [pdfDialog, setPdfDialog] = useState<PdfDialogState | null>(null);
   const [pdfImportMessage, setPdfImportMessage] = useState('');
   const [isImportingPdf, setIsImportingPdf] = useState(false);
+  const [visualOcrRecordIds, setVisualOcrRecordIds] = useState<Set<string>>(() => new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const workerRef = useRef<Tesseract.Worker | null>(null);
@@ -1281,6 +1408,18 @@ function App() {
         window.localStorage.setItem('passport-extractor-language', next);
       } catch {
         // Language preference is optional.
+      }
+      return next;
+    });
+  }
+
+  function toggleDeepScan() {
+    setIsDeepScan((current) => {
+      const next = !current;
+      try {
+        window.localStorage.setItem('passport-extractor-deep-scan', String(next));
+      } catch {
+        // Deep Scan preference is optional.
       }
       return next;
     });
@@ -1356,7 +1495,7 @@ function App() {
     return worker;
   }
 
-  function buildMrzAttempts(rotationAngle: number) {
+  function buildMrzAttempts(rotationAngle: number, deepScan: boolean) {
     const selected = normalizeAngle(rotationAngle);
     const angles = uniqueAngles([selected, selected + 90, selected + 180, selected + 270]);
     const attempts: Array<{
@@ -1364,6 +1503,18 @@ function App() {
       crop: (typeof mrzCropBands)[number];
       variant: (typeof mrzVariants)[number];
     }> = [];
+
+    if (!deepScan) {
+      attempts.push({ rotation: selected, crop: mrzCropBands[1], variant: 'contrast' });
+      attempts.push({ rotation: selected, crop: mrzCropBands[0], variant: 'contrast' });
+      attempts.push({ rotation: selected, crop: mrzCropBands[1], variant: 'binary' });
+
+      for (const rotation of angles.filter((angle) => angle !== selected)) {
+        attempts.push({ rotation, crop: mrzCropBands[1], variant: 'contrast' });
+      }
+
+      return attempts;
+    }
 
     for (const crop of mrzCropBands) {
       for (const variant of mrzVariants) {
@@ -1379,8 +1530,12 @@ function App() {
     return attempts;
   }
 
-  async function runMrzExtraction(record: PassportRecord, worker: Tesseract.Worker) {
-    const attempts = buildMrzAttempts(record.rotationAngle);
+  async function runMrzExtraction(
+    record: PassportRecord,
+    getWorker: () => Promise<Tesseract.Worker>,
+    deepScan: boolean,
+  ) {
+    const attempts = buildMrzAttempts(record.rotationAngle, deepScan);
     let bestParsed: ParsedCandidate | null = record.embeddedText ? parseBestMrz(record.embeddedText) : null;
     let bestText = record.embeddedText;
     let bestAttempt: ExtractionAttempt | null = bestParsed
@@ -1396,6 +1551,8 @@ function App() {
     if (bestParsed?.result.valid) {
       return { parsed: bestParsed, ocrText: bestText, attempt: bestAttempt };
     }
+
+    const worker = await getWorker();
 
     for (const [index, attempt] of attempts.entries()) {
       setRecord(record.id, (current) => ({
@@ -1459,24 +1616,20 @@ function App() {
     }));
 
     try {
-      const worker = await ensureWorker();
       setRecord(record.id, (current) => ({
         ...current,
         progress: 18,
         message: record.embeddedText ? 'Checking PDF text' : 'Reading MRZ',
       }));
-      const extraction = await runMrzExtraction(record, worker);
+      const extraction = await runMrzExtraction(record, ensureWorker, isDeepScan);
 
       setRecord(record.id, (current) => ({
         ...current,
-        progress: 82,
-        message: 'Reading visual text',
+        progress: 92,
+        message: 'Parsing data',
         ocrText: extraction.ocrText,
         extractionAttempt: extraction.attempt,
       }));
-      const visualOcrText = await runVisualOcr(record);
-
-      setRecord(record.id, (current) => ({ ...current, progress: 92, message: 'Parsing data', visualOcrText }));
       const parsed = extraction.parsed;
 
       if (!parsed) {
@@ -1486,7 +1639,6 @@ function App() {
           progress: 100,
           message: 'Manual review',
           ocrText: extraction.ocrText,
-          visualOcrText,
           extractionAttempt: extraction.attempt,
           valid: false,
           error: 'No valid TD3 passport MRZ candidate was found.',
@@ -1507,7 +1659,6 @@ function App() {
         valid: parsed.result.valid,
         validationDetails,
         ocrText: extraction.ocrText,
-        visualOcrText,
         extractionAttempt: extraction.attempt,
         error: parsed.result.valid ? '' : 'MRZ was parsed but one or more check fields did not validate.',
       }));
@@ -1522,6 +1673,30 @@ function App() {
       }));
     } finally {
       activeRecordIdRef.current = null;
+    }
+  }
+
+  async function readVisualText(record: PassportRecord) {
+    if (visualOcrRecordIds.has(record.id)) {
+      return;
+    }
+
+    setVisualOcrRecordIds((current) => new Set(current).add(record.id));
+    try {
+      const visualOcrText = await runVisualOcr(record);
+      setRecord(record.id, (current) => ({
+        ...current,
+        visualOcrText,
+      }));
+    } catch {
+      setCopiedLabel(t('ocrFailed'));
+      window.setTimeout(() => setCopiedLabel(''), 1400);
+    } finally {
+      setVisualOcrRecordIds((current) => {
+        const next = new Set(current);
+        next.delete(record.id);
+        return next;
+      });
     }
   }
 
@@ -1867,6 +2042,15 @@ function App() {
             <Camera size={17} />
             {t('camera')}
           </button>
+          <button
+            className={`button ${isDeepScan ? 'active' : ''}`}
+            type="button"
+            onClick={toggleDeepScan}
+            title={isDeepScan ? t('deepScanHint') : t('fastModeHint')}
+          >
+            <Sparkles size={17} />
+            {isDeepScan ? t('deepScanMode') : t('fastMode')}
+          </button>
           <button className="button" type="button" onClick={exportJson} disabled={!records.length}>
             <FileJson size={17} />
             {t('json')}
@@ -1961,6 +2145,15 @@ function App() {
                   <button className="button compact" type="button" onClick={() => retryRecord(record)}>
                     <Search size={15} />
                     {t('reextract')}
+                  </button>
+                  <button
+                    className="button compact"
+                    type="button"
+                    onClick={() => readVisualText(record)}
+                    disabled={visualOcrRecordIds.has(record.id)}
+                  >
+                    {visualOcrRecordIds.has(record.id) ? <Loader2 size={15} className="spin" /> : <Languages size={15} />}
+                    {visualOcrRecordIds.has(record.id) ? t('visualOcrRunning') : t('visualOcrButton')}
                   </button>
                   <button className="icon-button" type="button" onClick={() => updateRotation(record.id, record.rotationAngle - 90)} title={t('rotateLeft')}>
                     <RotateCcw size={16} />

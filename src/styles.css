@@ -127,6 +127,12 @@ button {
   color: #ffffff;
 }
 
+.button.active {
+  border-color: #1d6d5c;
+  color: #0f513f;
+  background: #effaf6;
+}
+
 .button.compact {
   min-height: 34px;
   padding: 0 10px;
